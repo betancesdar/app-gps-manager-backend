@@ -1,19 +1,22 @@
 /**
  * Stream Controller
  * Handles real-time coordinate streaming to devices
+ * Now async for PostgreSQL + Redis operations
  */
 
 const streamService = require('../services/stream.service');
 const deviceService = require('../services/device.service');
 const routeService = require('../services/route.service');
+const auditService = require('../services/audit.service');
 
 /**
  * POST /api/stream/start
  * Start streaming coordinates to a device
  */
-function startStream(req, res) {
+async function startStream(req, res) {
     try {
         const { deviceId, routeId, speed, accuracy, loop, intervalMs } = req.body;
+        const userId = req.user?.userId;
 
         if (!deviceId || !routeId) {
             return res.status(400).json({
@@ -23,7 +26,8 @@ function startStream(req, res) {
         }
 
         // Validate device exists
-        if (!deviceService.deviceExists(deviceId)) {
+        const deviceExists = await deviceService.deviceExists(deviceId);
+        if (!deviceExists) {
             return res.status(404).json({
                 success: false,
                 error: 'Device not found'
@@ -31,7 +35,8 @@ function startStream(req, res) {
         }
 
         // Validate route exists
-        if (!routeService.routeExists(routeId)) {
+        const routeExists = await routeService.routeExists(routeId);
+        if (!routeExists) {
             return res.status(404).json({
                 success: false,
                 error: 'Route not found'
@@ -44,7 +49,14 @@ function startStream(req, res) {
         if (loop !== undefined) options.loop = loop;
         if (intervalMs !== undefined) options.intervalMs = intervalMs;
 
-        const stream = streamService.startStream(deviceId, routeId, options);
+        const stream = await streamService.startStream(deviceId, routeId, options);
+
+        // Audit log
+        await auditService.log(auditService.ACTIONS.STREAM_START, {
+            userId,
+            deviceId,
+            meta: { routeId, options }
+        });
 
         return res.status(200).json({
             success: true,
@@ -64,9 +76,10 @@ function startStream(req, res) {
  * POST /api/stream/pause
  * Pause streaming for a device
  */
-function pauseStream(req, res) {
+async function pauseStream(req, res) {
     try {
         const { deviceId } = req.body;
+        const userId = req.user?.userId;
 
         if (!deviceId) {
             return res.status(400).json({
@@ -75,7 +88,7 @@ function pauseStream(req, res) {
             });
         }
 
-        const result = streamService.pauseStream(deviceId);
+        const result = await streamService.pauseStream(deviceId);
 
         if (!result) {
             return res.status(404).json({
@@ -83,6 +96,12 @@ function pauseStream(req, res) {
                 error: 'No active stream for this device'
             });
         }
+
+        // Audit log
+        await auditService.log(auditService.ACTIONS.STREAM_PAUSE, {
+            userId,
+            deviceId
+        });
 
         return res.status(200).json({
             success: true,
@@ -102,9 +121,10 @@ function pauseStream(req, res) {
  * POST /api/stream/resume
  * Resume streaming for a device
  */
-function resumeStream(req, res) {
+async function resumeStream(req, res) {
     try {
         const { deviceId } = req.body;
+        const userId = req.user?.userId;
 
         if (!deviceId) {
             return res.status(400).json({
@@ -113,7 +133,7 @@ function resumeStream(req, res) {
             });
         }
 
-        const result = streamService.resumeStream(deviceId);
+        const result = await streamService.resumeStream(deviceId);
 
         if (!result) {
             return res.status(404).json({
@@ -121,6 +141,12 @@ function resumeStream(req, res) {
                 error: 'No paused stream for this device'
             });
         }
+
+        // Audit log
+        await auditService.log(auditService.ACTIONS.STREAM_RESUME, {
+            userId,
+            deviceId
+        });
 
         return res.status(200).json({
             success: true,
@@ -140,9 +166,10 @@ function resumeStream(req, res) {
  * POST /api/stream/stop
  * Stop streaming for a device
  */
-function stopStream(req, res) {
+async function stopStream(req, res) {
     try {
         const { deviceId } = req.body;
+        const userId = req.user?.userId;
 
         if (!deviceId) {
             return res.status(400).json({
@@ -151,7 +178,7 @@ function stopStream(req, res) {
             });
         }
 
-        const result = streamService.stopStream(deviceId);
+        const result = await streamService.stopStream(deviceId);
 
         if (!result) {
             return res.status(404).json({
@@ -159,6 +186,12 @@ function stopStream(req, res) {
                 error: 'No active stream for this device'
             });
         }
+
+        // Audit log
+        await auditService.log(auditService.ACTIONS.STREAM_STOP, {
+            userId,
+            deviceId
+        });
 
         return res.status(200).json({
             success: true,
@@ -178,11 +211,11 @@ function stopStream(req, res) {
  * GET /api/stream/status/:deviceId
  * Get stream status for a device
  */
-function getStreamStatus(req, res) {
+async function getStreamStatus(req, res) {
     try {
         const { deviceId } = req.params;
 
-        const status = streamService.getStreamStatus(deviceId);
+        const status = await streamService.getStreamStatus(deviceId);
 
         if (!status) {
             return res.status(404).json({
@@ -226,11 +259,37 @@ function getAllStreams(req, res) {
     }
 }
 
+/**
+ * GET /api/stream/history/:deviceId
+ * Get stream history for a device
+ */
+async function getStreamHistory(req, res) {
+    try {
+        const { deviceId } = req.params;
+        const limit = parseInt(req.query.limit) || 10;
+
+        const history = await streamService.getStreamHistory(deviceId, limit);
+
+        return res.status(200).json({
+            success: true,
+            data: history,
+            count: history.length
+        });
+    } catch (error) {
+        console.error('Get stream history error:', error);
+        return res.status(500).json({
+            success: false,
+            error: 'Failed to get stream history'
+        });
+    }
+}
+
 module.exports = {
     startStream,
     pauseStream,
     resumeStream,
     stopStream,
     getStreamStatus,
-    getAllStreams
+    getAllStreams,
+    getStreamHistory
 };

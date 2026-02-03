@@ -1,126 +1,202 @@
 /**
  * WebSocket Server
- * Handles real-time WebSocket connections with JWT authentication
+ * Uses noServer: true + manual upgrade handling
+ * Token and deviceId come from HEADERS
+ * Validates against Redis + PostgreSQL
  */
 
-const WebSocket = require('ws');
-const url = require('url');
+const { WebSocketServer } = require('ws');
 const { verifyToken } = require('../utils/jwt.util');
 const deviceService = require('../services/device.service');
+const auditService = require('../services/audit.service');
 
-/**
- * Initialize WebSocket server
- * @param {http.Server} server - HTTP server instance
- */
-function initWebSocket(server) {
-    const wss = new WebSocket.Server({
-        server,
-        path: '/ws'
-    });
+// Create WebSocket server with noServer: true
+// This is CRITICAL - prevents Express from intercepting /ws
+const wss = new WebSocketServer({ noServer: true });
 
-    wss.on('connection', (ws, req) => {
-        // Parse query parameters for token and deviceId
-        const queryParams = url.parse(req.url, true).query;
-        const token = queryParams.token;
-        const deviceId = queryParams.deviceId;
+// Handle WebSocket connections
+wss.on('connection', async (ws, req) => {
+    // Read token and deviceId from HEADERS
+    const token = req.headers['authorization']?.replace('Bearer ', '');
+    const deviceId = req.headers['x-device-id'];
+    const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
 
-        // Validate JWT token
-        if (!token) {
-            console.log('❌ WebSocket connection rejected: No token provided');
-            ws.close(4001, 'Authentication required');
-            return;
+    console.log('🔐 WS CONNECT token:', token ? token.substring(0, 20) + '...' : 'missing');
+    console.log('📱 WS CONNECT deviceId:', deviceId);
+    console.log('🌐 WS CONNECT IP:', clientIp);
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Validation 1: Check token exists
+    // ═══════════════════════════════════════════════════════════════════
+    if (!token) {
+        console.log('❌ WebSocket rejected: No token provided');
+        await auditService.log(auditService.ACTIONS.WS_AUTH_FAIL, {
+            deviceId,
+            meta: { reason: 'no_token', ip: clientIp }
+        });
+        ws.close(4001, 'auth required');
+        return;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Validation 2: Check deviceId exists
+    // ═══════════════════════════════════════════════════════════════════
+    if (!deviceId) {
+        console.log('❌ WebSocket rejected: No deviceId provided');
+        await auditService.log(auditService.ACTIONS.WS_AUTH_FAIL, {
+            meta: { reason: 'no_device_id', ip: clientIp }
+        });
+        ws.close(4003, 'deviceId required');
+        return;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Validation 3: Verify JWT is valid
+    // ═══════════════════════════════════════════════════════════════════
+    let decodedToken;
+    try {
+        decodedToken = verifyToken(token);
+    } catch (error) {
+        console.log('❌ WebSocket rejected: Invalid token -', error.message);
+        await auditService.log(auditService.ACTIONS.WS_AUTH_FAIL, {
+            deviceId,
+            meta: { reason: 'invalid_token', error: error.message, ip: clientIp }
+        });
+        ws.close(4002, 'invalid token');
+        return;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Validation 4: Check Redis authorization
+    // ═══════════════════════════════════════════════════════════════════
+    const isAuthorized = await deviceService.isDeviceAuthorizedForWS(deviceId, token);
+    if (!isAuthorized) {
+        console.log(`❌ WebSocket rejected: Device ${deviceId} not authorized in Redis`);
+        await auditService.log(auditService.ACTIONS.WS_AUTH_FAIL, {
+            userId: decodedToken?.userId,
+            deviceId,
+            meta: { reason: 'not_authorized_redis', ip: clientIp }
+        });
+        ws.close(4004, 'device not registered');
+        return;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Validation 5: Check device exists in PostgreSQL
+    // ═══════════════════════════════════════════════════════════════════
+    const deviceExists = await deviceService.deviceExists(deviceId);
+    if (!deviceExists) {
+        console.log(`❌ WebSocket rejected: Device ${deviceId} not found in database`);
+        await auditService.log(auditService.ACTIONS.WS_AUTH_FAIL, {
+            userId: decodedToken?.userId,
+            deviceId,
+            meta: { reason: 'not_in_database', ip: clientIp }
+        });
+        ws.close(4004, 'device not registered');
+        return;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // SUCCESS: Associate WebSocket connection with device
+    // ═══════════════════════════════════════════════════════════════════
+    try {
+        await deviceService.setDeviceConnection(deviceId, ws);
+
+        // Update device with last IP
+        await deviceService.updateDevice(deviceId, { lastIp: clientIp });
+
+        // Audit log
+        await auditService.log(auditService.ACTIONS.WS_CONNECT, {
+            userId: decodedToken?.userId,
+            deviceId,
+            meta: { ip: clientIp }
+        });
+
+        console.log(`✅ Device ${deviceId} connected via WebSocket`);
+    } catch (error) {
+        console.error(`❌ Failed to set device connection:`, error.message);
+        ws.close(4500, 'internal error');
+        return;
+    }
+
+    // Send welcome message
+    ws.send(JSON.stringify({
+        type: 'CONNECTED',
+        payload: {
+            deviceId,
+            message: 'Connected to GPS Mock Location Server',
+            timestamp: new Date().toISOString()
         }
+    }));
 
-        let decoded;
+    // ═══════════════════════════════════════════════════════════════════
+    // Handle incoming messages from device
+    // ═══════════════════════════════════════════════════════════════════
+    ws.on('message', async (data) => {
         try {
-            decoded = verifyToken(token);
+            const message = JSON.parse(data.toString());
+            console.log(`📥 Message from ${deviceId}:`, message.type);
+
+            switch (message.type) {
+                case 'PING':
+                    // Refresh connection TTL in Redis
+                    await deviceService.refreshDeviceConnection(deviceId);
+                    ws.send(JSON.stringify({
+                        type: 'PONG',
+                        timestamp: new Date().toISOString()
+                    }));
+                    break;
+
+                case 'STATUS':
+                    await deviceService.updateDevice(deviceId, {
+                        lastStatus: message.payload
+                    });
+                    break;
+
+                case 'ACK':
+                    // Device acknowledging received location
+                    break;
+
+                default:
+                    console.log(`📨 Unknown message type: ${message.type}`);
+            }
         } catch (error) {
-            console.log('❌ WebSocket connection rejected: Invalid token');
-            ws.close(4002, 'Invalid token');
-            return;
+            console.log(`⚠️ Invalid message from ${deviceId}:`, data.toString().substring(0, 100));
         }
-
-        // Validate deviceId
-        if (!deviceId) {
-            console.log('❌ WebSocket connection rejected: No deviceId provided');
-            ws.close(4003, 'deviceId required');
-            return;
-        }
-
-        // Check if device is registered
-        if (!deviceService.deviceExists(deviceId)) {
-            console.log(`❌ WebSocket connection rejected: Device ${deviceId} not registered`);
-            ws.close(4004, 'Device not registered');
-            return;
-        }
-
-        // Associate WebSocket connection with device
-        deviceService.setDeviceConnection(deviceId, ws);
-
-        console.log(`🔗 Device ${deviceId} connected via WebSocket`);
-
-        // Send welcome message
-        ws.send(JSON.stringify({
-            type: 'CONNECTED',
-            payload: {
-                deviceId,
-                message: 'Connected to GPS Mock Location Server',
-                user: decoded.username
-            }
-        }));
-
-        // Handle incoming messages from device
-        ws.on('message', (data) => {
-            try {
-                const message = JSON.parse(data.toString());
-                console.log(`📥 Message from ${deviceId}:`, message);
-
-                // Handle different message types from Android
-                switch (message.type) {
-                    case 'PING':
-                        ws.send(JSON.stringify({
-                            type: 'PONG',
-                            timestamp: new Date().toISOString()
-                        }));
-                        break;
-
-                    case 'STATUS':
-                        // Device sending its status
-                        deviceService.updateDevice(deviceId, {
-                            lastStatus: message.payload
-                        });
-                        break;
-
-                    case 'ACK':
-                        // Device acknowledging received location
-                        // Can be used for flow control if needed
-                        break;
-
-                    default:
-                        console.log(`📨 Unknown message type: ${message.type}`);
-                }
-            } catch (error) {
-                console.log(`⚠️ Invalid message from ${deviceId}:`, data.toString());
-            }
-        });
-
-        // Handle connection close
-        ws.on('close', (code, reason) => {
-            console.log(`❌ Device ${deviceId} disconnected (code: ${code})`);
-            deviceService.removeDeviceConnection(deviceId);
-        });
-
-        // Handle errors
-        ws.on('error', (error) => {
-            console.error(`⚠️ WebSocket error for ${deviceId}:`, error.message);
-            deviceService.removeDeviceConnection(deviceId);
-        });
     });
 
-    // Log WebSocket server status
-    console.log('📡 WebSocket server initialized on path /ws');
+    // ═══════════════════════════════════════════════════════════════════
+    // Handle connection close
+    // ═══════════════════════════════════════════════════════════════════
+    ws.on('close', async (code, reason) => {
+        console.log(`❌ Device ${deviceId} disconnected (code: ${code}, reason: ${reason?.toString() || 'none'})`);
 
-    return wss;
-}
+        try {
+            await deviceService.removeDeviceConnection(deviceId);
+            await auditService.log(auditService.ACTIONS.WS_DISCONNECT, {
+                userId: decodedToken?.userId,
+                deviceId,
+                meta: { code, reason: reason?.toString() }
+            });
+        } catch (error) {
+            console.error(`⚠️ Error handling disconnect:`, error.message);
+        }
+    });
 
-module.exports = initWebSocket;
+    // ═══════════════════════════════════════════════════════════════════
+    // Handle errors
+    // ═══════════════════════════════════════════════════════════════════
+    ws.on('error', async (error) => {
+        console.error(`⚠️ WebSocket error for ${deviceId}:`, error.message);
+
+        try {
+            await deviceService.removeDeviceConnection(deviceId);
+        } catch (err) {
+            console.error(`⚠️ Error removing connection:`, err.message);
+        }
+    });
+});
+
+console.log('📡 WebSocket server initialized (noServer mode with Redis + PostgreSQL validation)');
+
+module.exports = { wss };

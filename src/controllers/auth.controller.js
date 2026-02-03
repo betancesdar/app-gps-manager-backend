@@ -1,16 +1,17 @@
 /**
  * Authentication Controller
- * Handles login and token generation
+ * Handles login with PostgreSQL + bcrypt
  */
 
 const { generateToken } = require('../utils/jwt.util');
-const config = require('../config/config');
+const userService = require('../services/user.service');
+const auditService = require('../services/audit.service');
 
 /**
  * POST /api/auth/login
- * Simple login with username/password
+ * Login with username/password
  */
-function login(req, res) {
+async function login(req, res) {
     try {
         const { username, password } = req.body;
 
@@ -21,9 +22,31 @@ function login(req, res) {
             });
         }
 
-        // Simple validation (replace with DB lookup in production)
-        if (username !== config.DEFAULT_USER.username ||
-            password !== config.DEFAULT_USER.password) {
+        // Find user in PostgreSQL
+        const user = await userService.findByUsername(username);
+
+        if (!user) {
+            // Log failed attempt
+            await auditService.log(auditService.ACTIONS.LOGIN_FAILED, {
+                meta: { username, reason: 'User not found' }
+            });
+
+            return res.status(401).json({
+                success: false,
+                error: 'Invalid credentials'
+            });
+        }
+
+        // Validate password with bcrypt
+        const isValidPassword = await userService.validatePassword(password, user.passwordHash);
+
+        if (!isValidPassword) {
+            // Log failed attempt
+            await auditService.log(auditService.ACTIONS.LOGIN_FAILED, {
+                userId: user.id,
+                meta: { reason: 'Invalid password' }
+            });
+
             return res.status(401).json({
                 success: false,
                 error: 'Invalid credentials'
@@ -32,8 +55,15 @@ function login(req, res) {
 
         // Generate JWT token
         const token = generateToken({
-            username,
-            role: 'admin'
+            userId: user.id,
+            username: user.username,
+            role: user.role
+        });
+
+        // Log successful login
+        await auditService.log(auditService.ACTIONS.LOGIN_SUCCESS, {
+            userId: user.id,
+            meta: { ip: req.ip }
         });
 
         return res.status(200).json({
@@ -41,8 +71,9 @@ function login(req, res) {
             data: {
                 token,
                 user: {
-                    username,
-                    role: 'admin'
+                    id: user.id,
+                    username: user.username,
+                    role: user.role
                 }
             }
         });

@@ -5,6 +5,8 @@
 
 const express = require('express');
 const cors = require('cors');
+const swaggerUi = require('swagger-ui-express');
+const swaggerSpecs = require('./config/swagger');
 
 // Import routes
 const authRoutes = require('./routes/auth.routes');
@@ -18,6 +20,16 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '10mb' })); // Increased for GPX files
 app.use(express.urlencoded({ extended: true }));
+
+// Swagger UI - Available at http://localhost:4000
+app.use('/', swaggerUi.serve);
+app.get('/', swaggerUi.setup(swaggerSpecs, {
+    customCss: '.swagger-ui .topbar { display: none }',
+    customSiteTitle: 'GPS Mock Location API'
+}));
+
+// Also available at /api-docs
+app.use('/api-docs', swaggerUi.serve, swaggerUi.setup(swaggerSpecs));
 
 // Health check endpoint
 app.get('/health', (req, res) => {

@@ -1,0 +1,132 @@
+// ═══════════════════════════════════════════════════════════════════
+// GPS Mock Location Backend - Prisma Schema
+// PostgreSQL database schema with all entities
+// ═══════════════════════════════════════════════════════════════════
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Users Table
+// ─────────────────────────────────────────────────────────────────
+model User {
+  id           String   @id @default(uuid())
+  username     String   @unique
+  passwordHash String   @map("password_hash")
+  role         String   @default("user")
+  createdAt    DateTime @default(now()) @map("created_at")
+  
+  // Relations
+  devices      Device[]
+  routes       Route[]
+  auditLogs    AuditLog[]
+
+  @@map("users")
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Devices Table
+// ─────────────────────────────────────────────────────────────────
+model Device {
+  id           String    @id @default(uuid())
+  deviceId     String    @unique @map("device_id")
+  userId       String    @map("user_id")
+  platform     String    @default("android")
+  appVersion   String    @default("1.0.0") @map("app_version")
+  registeredAt DateTime  @default(now()) @map("registered_at")
+  lastSeenAt   DateTime  @default(now()) @map("last_seen_at")
+  isConnected  Boolean   @default(false) @map("is_connected")
+  lastIp       String?   @map("last_ip")
+  
+  // Relations
+  user         User      @relation(fields: [userId], references: [id])
+  streams      Stream[]
+  auditLogs    AuditLog[]
+
+  @@map("devices")
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Routes Table
+// ─────────────────────────────────────────────────────────────────
+model Route {
+  id         String       @id @default(uuid())
+  userId     String       @map("user_id")
+  name       String?
+  sourceType String       @default("points") @map("source_type")
+  config     Json?
+  createdAt  DateTime     @default(now()) @map("created_at")
+  
+  // Relations
+  user       User         @relation(fields: [userId], references: [id])
+  points     RoutePoint[]
+  streams    Stream[]
+
+  @@map("routes")
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Route Points Table
+// ─────────────────────────────────────────────────────────────────
+model RoutePoint {
+  id       String  @id @default(uuid())
+  routeId  String  @map("route_id")
+  seq      Int
+  lat      Float
+  lng      Float
+  speed    Float?
+  bearing  Float?
+  accuracy Float?
+  
+  // Relations
+  route    Route   @relation(fields: [routeId], references: [id], onDelete: Cascade)
+
+  @@map("route_points")
+  @@index([routeId, seq])
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Streams Table (Historical)
+// ─────────────────────────────────────────────────────────────────
+model Stream {
+  id        String    @id @default(uuid())
+  deviceId  String    @map("device_id")
+  routeId   String    @map("route_id")
+  status    String    @default("STARTED")  // STARTED, PAUSED, STOPPED
+  speed     Float     @default(30)
+  loop      Boolean   @default(false)
+  startedAt DateTime  @default(now()) @map("started_at")
+  stoppedAt DateTime? @map("stopped_at")
+  
+  // Relations
+  device    Device    @relation(fields: [deviceId], references: [deviceId])
+  route     Route     @relation(fields: [routeId], references: [id])
+
+  @@map("streams")
+  @@index([deviceId, status])
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Audit Logs Table
+// ─────────────────────────────────────────────────────────────────
+model AuditLog {
+  id        String   @id @default(uuid())
+  userId    String?  @map("user_id")
+  deviceId  String?  @map("device_id")
+  action    String
+  meta      Json?
+  createdAt DateTime @default(now()) @map("created_at")
+  
+  // Relations
+  user      User?    @relation(fields: [userId], references: [id])
+  device    Device?  @relation(fields: [deviceId], references: [deviceId])
+
+  @@map("audit_logs")
+  @@index([action, createdAt])
+}

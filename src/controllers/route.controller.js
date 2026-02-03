@@ -1,18 +1,20 @@
 /**
  * Route Controller
- * Handles route creation and management
+ * Handles route creation and management with PostgreSQL persistence
  */
 
 const routeService = require('../services/route.service');
+const auditService = require('../services/audit.service');
 const { parseGPX, validateCoordinates } = require('../utils/gpx.parser');
 
 /**
  * POST /api/routes/from-points
  * Create route from array of points
  */
-function createFromPoints(req, res) {
+async function createFromPoints(req, res) {
     try {
         const { name, points } = req.body;
+        const userId = req.user?.userId;
 
         if (!points || !Array.isArray(points) || points.length < 2) {
             return res.status(400).json({
@@ -28,7 +30,13 @@ function createFromPoints(req, res) {
             });
         }
 
-        const route = routeService.createRoute({ name, points });
+        const route = await routeService.createRoute({ name, points }, userId);
+
+        // Audit log
+        await auditService.log(auditService.ACTIONS.ROUTE_CREATE, {
+            userId,
+            meta: { routeId: route.routeId, name: route.name, pointCount: points.length }
+        });
 
         return res.status(201).json({
             success: true,
@@ -48,9 +56,10 @@ function createFromPoints(req, res) {
  * POST /api/routes/from-gpx
  * Create route from GPX content
  */
-function createFromGPX(req, res) {
+async function createFromGPX(req, res) {
     try {
         const { name, gpxContent } = req.body;
+        const userId = req.user?.userId;
 
         if (!gpxContent) {
             return res.status(400).json({
@@ -68,7 +77,16 @@ function createFromGPX(req, res) {
             });
         }
 
-        const route = routeService.createRoute({ name, points });
+        const route = await routeService.createRoute(
+            { name, points, sourceType: 'gpx' },
+            userId
+        );
+
+        // Audit log
+        await auditService.log(auditService.ACTIONS.ROUTE_CREATE, {
+            userId,
+            meta: { routeId: route.routeId, name: route.name, pointCount: points.length, source: 'gpx' }
+        });
 
         return res.status(201).json({
             success: true,
@@ -88,9 +106,13 @@ function createFromGPX(req, res) {
  * GET /api/routes
  * Get all routes
  */
-function getAllRoutes(req, res) {
+async function getAllRoutes(req, res) {
     try {
-        const routes = routeService.getAllRoutes();
+        const userId = req.user?.userId;
+        // If admin, show all routes; otherwise filter by user
+        const filterUserId = req.user?.role === 'admin' ? null : userId;
+
+        const routes = await routeService.getAllRoutes(filterUserId);
 
         return res.status(200).json({
             success: true,
@@ -108,12 +130,12 @@ function getAllRoutes(req, res) {
 
 /**
  * GET /api/routes/:routeId
- * Get route by ID
+ * Get route by ID with points
  */
-function getRoute(req, res) {
+async function getRoute(req, res) {
     try {
         const { routeId } = req.params;
-        const route = routeService.getRoute(routeId);
+        const route = await routeService.getRoute(routeId);
 
         if (!route) {
             return res.status(404).json({
@@ -139,12 +161,13 @@ function getRoute(req, res) {
  * PUT /api/routes/:routeId/config
  * Update route configuration
  */
-function updateRouteConfig(req, res) {
+async function updateRouteConfig(req, res) {
     try {
         const { routeId } = req.params;
         const { speed, accuracy, intervalMs, loop, pauses } = req.body;
 
-        if (!routeService.routeExists(routeId)) {
+        const exists = await routeService.routeExists(routeId);
+        if (!exists) {
             return res.status(404).json({
                 success: false,
                 error: 'Route not found'
@@ -158,7 +181,7 @@ function updateRouteConfig(req, res) {
         if (loop !== undefined) configUpdate.loop = loop;
         if (pauses !== undefined) configUpdate.pauses = pauses;
 
-        const route = routeService.updateRouteConfig(routeId, configUpdate);
+        const route = await routeService.updateRouteConfig(routeId, configUpdate);
 
         return res.status(200).json({
             success: true,
@@ -178,18 +201,26 @@ function updateRouteConfig(req, res) {
  * DELETE /api/routes/:routeId
  * Delete route
  */
-function deleteRoute(req, res) {
+async function deleteRoute(req, res) {
     try {
         const { routeId } = req.params;
+        const userId = req.user?.userId;
 
-        if (!routeService.routeExists(routeId)) {
+        const exists = await routeService.routeExists(routeId);
+        if (!exists) {
             return res.status(404).json({
                 success: false,
                 error: 'Route not found'
             });
         }
 
-        routeService.deleteRoute(routeId);
+        await routeService.deleteRoute(routeId);
+
+        // Audit log
+        await auditService.log(auditService.ACTIONS.ROUTE_DELETE, {
+            userId,
+            meta: { routeId }
+        });
 
         return res.status(200).json({
             success: true,

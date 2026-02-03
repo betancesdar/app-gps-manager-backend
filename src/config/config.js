@@ -1,22 +1,31 @@
 /**
  * Application Configuration
  * Centralized configuration for the GPS Mock Location Backend
+ * Supports both local development and Docker deployment
  */
 
 module.exports = {
     // Server
     PORT: process.env.PORT || 4000,
-    
+    NODE_ENV: process.env.NODE_ENV || 'development',
+
+    // Database (PostgreSQL)
+    DATABASE_URL: process.env.DATABASE_URL,
+
+    // Redis
+    REDIS_URL: process.env.REDIS_URL || 'redis://localhost:6379',
+
     // JWT
     JWT_SECRET: process.env.JWT_SECRET || 'default_jwt_secret_change_me',
     JWT_EXPIRES_IN: process.env.JWT_EXPIRES_IN || '7d',
-    
-    // Default credentials (for simple auth - replace with DB in production)
-    DEFAULT_USER: {
-        username: 'admin',
-        password: 'admin123'
-    },
-    
+
+    // Default admin credentials (for first-run seeding)
+    DEFAULT_ADMIN_PASSWORD: process.env.DEFAULT_ADMIN_PASSWORD || 'admin123',
+
+    // Redis TTLs (seconds)
+    WS_AUTH_TTL: parseInt(process.env.WS_AUTH_TTL) || 900,      // 15 minutes
+    WS_CONN_TTL: parseInt(process.env.WS_CONN_TTL) || 120,      // 2 minutes
+
     // Stream defaults
     STREAM_DEFAULTS: {
         speed: 30,           // km/h

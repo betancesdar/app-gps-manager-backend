@@ -2,54 +2,148 @@
  * Server Entry Point
  * GPS Mock Location Backend
  * Port: 4000
+ * 
+ * Production-Ready with PostgreSQL + Redis
+ * CRITICAL: WebSocket uses noServer + manual upgrade handling
  */
 
 require('dotenv').config();
 const http = require('http');
 const app = require('./app');
-const initWebSocket = require('./websocket/ws.server');
+const { wss } = require('./websocket/ws.server');
 const config = require('./config/config');
+const { connectDatabase, disconnectDatabase } = require('./lib/prisma');
+const { connectRedis, disconnectRedis } = require('./lib/redis');
+const userService = require('./services/user.service');
 
 // Create HTTP server
 const server = http.createServer(app);
 
-// Initialize WebSocket server
-initWebSocket(server);
+// CRITICAL: Manual WebSocket upgrade handler
+// This prevents Express from intercepting /ws and returning 400
+server.on('upgrade', (req, socket, head) => {
+    console.log('🔥 WS UPGRADE HIT');
+    console.log('🔥 URL:', req.url);
+    console.log('🔥 HEADERS:', JSON.stringify({
+        authorization: req.headers['authorization'] ? 'Bearer ***' : undefined,
+        'x-device-id': req.headers['x-device-id']
+    }));
 
-// Start server
-const PORT = config.PORT;
-server.listen(PORT, () => {
-    console.log('═══════════════════════════════════════════');
-    console.log('   🚀 GPS Mock Location Backend Started');
-    console.log('═══════════════════════════════════════════');
-    console.log(`   📡 HTTP Server:  http://localhost:${PORT}`);
-    console.log(`   🔌 WebSocket:    ws://localhost:${PORT}/ws`);
-    console.log('═══════════════════════════════════════════');
-    console.log('   📋 Endpoints:');
-    console.log(`      POST /api/auth/login`);
-    console.log(`      POST /api/devices/register`);
-    console.log(`      POST /api/routes/from-points`);
-    console.log(`      POST /api/routes/from-gpx`);
-    console.log(`      POST /api/stream/start`);
-    console.log(`      POST /api/stream/pause`);
-    console.log(`      POST /api/stream/resume`);
-    console.log(`      POST /api/stream/stop`);
-    console.log('═══════════════════════════════════════════');
-});
+    // Only handle /ws path
+    if (!req.url.startsWith('/ws')) {
+        console.log('❌ Not a WebSocket path, destroying socket');
+        socket.destroy();
+        return;
+    }
 
-// Handle graceful shutdown
-process.on('SIGTERM', () => {
-    console.log('Received SIGTERM. Shutting down gracefully...');
-    server.close(() => {
-        console.log('Server closed.');
-        process.exit(0);
+    // Handle upgrade and emit connection
+    wss.handleUpgrade(req, socket, head, (ws) => {
+        wss.emit('connection', ws, req);
     });
 });
 
-process.on('SIGINT', () => {
-    console.log('Received SIGINT. Shutting down gracefully...');
-    server.close(() => {
-        console.log('Server closed.');
-        process.exit(0);
+/**
+ * Initialize databases and start server
+ */
+async function startServer() {
+    try {
+        console.log('═══════════════════════════════════════════');
+        console.log('   🚀 Starting GPS Mock Location Backend');
+        console.log('═══════════════════════════════════════════');
+        console.log(`   Environment: ${config.NODE_ENV}`);
+
+        // Connect to PostgreSQL
+        console.log('\n📦 Connecting to PostgreSQL...');
+        await connectDatabase();
+
+        // Ensure default admin user exists
+        await userService.ensureDefaultUser();
+
+        // Connect to Redis
+        console.log('\n🔴 Connecting to Redis...');
+        await connectRedis();
+
+        // Start HTTP server
+        const PORT = config.PORT;
+        server.listen(PORT, '0.0.0.0', () => {
+            console.log('\n═══════════════════════════════════════════');
+            console.log('   ✅ GPS Mock Location Backend Started');
+            console.log('═══════════════════════════════════════════');
+            console.log(`   📡 HTTP Server:  http://0.0.0.0:${PORT}`);
+            console.log(`   🔌 WebSocket:    ws://0.0.0.0:${PORT}/ws`);
+            console.log('═══════════════════════════════════════════');
+            console.log('   📋 Endpoints:');
+            console.log(`      POST /api/auth/login`);
+            console.log(`      POST /api/devices/register`);
+            console.log(`      GET  /api/devices`);
+            console.log(`      POST /api/routes/from-points`);
+            console.log(`      POST /api/routes/from-gpx`);
+            console.log(`      POST /api/stream/start`);
+            console.log(`      POST /api/stream/pause`);
+            console.log(`      POST /api/stream/resume`);
+            console.log(`      POST /api/stream/stop`);
+            console.log('═══════════════════════════════════════════');
+            console.log('\n   💡 Admin credentials: admin / admin123');
+            console.log('═══════════════════════════════════════════\n');
+        });
+
+    } catch (error) {
+        console.error('❌ Failed to start server:', error);
+        process.exit(1);
+    }
+}
+
+/**
+ * Graceful shutdown
+ */
+async function gracefulShutdown(signal) {
+    console.log(`\n${signal} received. Starting graceful shutdown...`);
+
+    // Close HTTP server (stops accepting new connections)
+    server.close(async () => {
+        console.log('🛑 HTTP server closed');
+
+        try {
+            // Close all WebSocket connections
+            wss.clients.forEach((client) => {
+                client.close(1001, 'Server shutting down');
+            });
+            console.log('🔌 WebSocket connections closed');
+
+            // Disconnect from Redis
+            await disconnectRedis();
+
+            // Disconnect from PostgreSQL
+            await disconnectDatabase();
+
+            console.log('✅ Graceful shutdown complete');
+            process.exit(0);
+        } catch (error) {
+            console.error('❌ Error during shutdown:', error);
+            process.exit(1);
+        }
     });
+
+    // Force shutdown after 10 seconds
+    setTimeout(() => {
+        console.error('⚠️ Forcing shutdown after timeout');
+        process.exit(1);
+    }, 10000);
+}
+
+// Handle shutdown signals
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+// Handle uncaught errors
+process.on('uncaughtException', (error) => {
+    console.error('❌ Uncaught Exception:', error);
+    gracefulShutdown('UNCAUGHT_EXCEPTION');
 });
+
+process.on('unhandledRejection', (reason, promise) => {
+    console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
+});
+
+// Start the server
+startServer();

@@ -1,15 +1,18 @@
 /**
  * Stream Service
  * Manages coordinate streaming PER DEVICE
- * Map<deviceId, StreamInstance>
+ * PostgreSQL for history, Redis for hot state
+ * Map<deviceId, StreamInstance> for active intervals
  */
 
-const { calculateBearing, calculateDistance } = require('../utils/gpx.parser');
+const { prisma } = require('../lib/prisma');
+const redis = require('../lib/redis');
+const { calculateBearing } = require('../utils/gpx.parser');
 const deviceService = require('./device.service');
 const routeService = require('./route.service');
 const config = require('../config/config');
 
-// Active streams per device
+// Active streams per device (intervals, not serializable)
 // Map<deviceId, StreamInstance>
 const activeStreams = new Map();
 
@@ -18,13 +21,13 @@ const activeStreams = new Map();
  * Tracks streaming state for a single device
  */
 class StreamInstance {
-    constructor(deviceId, routeId, route) {
+    constructor(deviceId, routeId, points, streamConfig) {
         this.deviceId = deviceId;
         this.routeId = routeId;
-        this.points = route.points;
-        this.config = { ...route.config };
+        this.points = points;
+        this.config = { ...streamConfig };
         this.currentIndex = 0;
-        this.status = 'idle'; // idle, running, paused, stopped
+        this.status = 'idle';
         this.intervalId = null;
         this.startedAt = null;
         this.lastEmitAt = null;
@@ -38,40 +41,64 @@ class StreamInstance {
  * @param {Object} options - Override config options
  * @returns {Object} Stream info
  */
-function startStream(deviceId, routeId, options = {}) {
-    // Validate device exists and is connected
+async function startStream(deviceId, routeId, options = {}) {
+    // Validate device is connected
     const ws = deviceService.getDeviceConnection(deviceId);
     if (!ws) {
         throw new Error('Device not connected via WebSocket');
     }
 
-    // Get route
-    const route = routeService.getRoute(routeId);
+    // Get route from PostgreSQL
+    const route = await routeService.getRoute(routeId);
     if (!route) {
         throw new Error('Route not found');
     }
 
     // Stop any existing stream for this device
     if (activeStreams.has(deviceId)) {
-        stopStream(deviceId);
+        await stopStream(deviceId);
     }
 
-    // Create new stream instance
-    const stream = new StreamInstance(deviceId, routeId, route);
+    // Create stream config
+    const streamConfig = {
+        speed: options.speed || route.config?.speed || config.STREAM_DEFAULTS.speed,
+        accuracy: options.accuracy || route.config?.accuracy || config.STREAM_DEFAULTS.accuracy,
+        intervalMs: options.intervalMs || route.config?.intervalMs || config.STREAM_DEFAULTS.intervalMs,
+        loop: options.loop !== undefined ? options.loop : (route.config?.loop || config.STREAM_DEFAULTS.loop)
+    };
 
-    // Apply option overrides
-    if (options.speed) stream.config.speed = options.speed;
-    if (options.accuracy) stream.config.accuracy = options.accuracy;
-    if (options.loop !== undefined) stream.config.loop = options.loop;
-    if (options.intervalMs) stream.config.intervalMs = options.intervalMs;
-
+    // Create stream instance
+    const stream = new StreamInstance(deviceId, routeId, route.points, streamConfig);
     stream.status = 'running';
     stream.startedAt = new Date().toISOString();
+
+    // Save to PostgreSQL
+    const dbStream = await prisma.stream.create({
+        data: {
+            deviceId,
+            routeId,
+            status: 'STARTED',
+            speed: streamConfig.speed,
+            loop: streamConfig.loop
+        }
+    });
+    stream.dbId = dbStream.id;
+
+    // Save hot state to Redis
+    await redis.setStreamState(deviceId, {
+        streamId: dbStream.id,
+        routeId,
+        status: 'running',
+        currentIndex: 0,
+        totalPoints: route.points.length,
+        speed: streamConfig.speed,
+        loop: streamConfig.loop
+    });
 
     // Start emitting coordinates
     stream.intervalId = setInterval(() => {
         emitNextCoordinate(deviceId);
-    }, stream.config.intervalMs);
+    }, streamConfig.intervalMs);
 
     // Emit first coordinate immediately
     emitNextCoordinate(deviceId);
@@ -79,6 +106,7 @@ function startStream(deviceId, routeId, options = {}) {
     activeStreams.set(deviceId, stream);
 
     return {
+        streamId: dbStream.id,
         deviceId,
         routeId,
         status: stream.status,
@@ -91,20 +119,20 @@ function startStream(deviceId, routeId, options = {}) {
  * Emit the next coordinate to the device
  * @param {string} deviceId 
  */
-function emitNextCoordinate(deviceId) {
+async function emitNextCoordinate(deviceId) {
     const stream = activeStreams.get(deviceId);
     if (!stream || stream.status !== 'running') return;
 
     const ws = deviceService.getDeviceConnection(deviceId);
-    if (!ws || ws.readyState !== 1) { // 1 = OPEN
-        pauseStream(deviceId);
+    if (!ws || ws.readyState !== 1) {
+        await pauseStream(deviceId);
         return;
     }
 
     const currentPoint = stream.points[stream.currentIndex];
     const nextPoint = stream.points[stream.currentIndex + 1] || stream.points[0];
 
-    // Calculate bearing (direction of movement)
+    // Calculate bearing
     const bearing = calculateBearing(currentPoint, nextPoint);
 
     // Build MOCK_LOCATION message
@@ -128,9 +156,14 @@ function emitNextCoordinate(deviceId) {
     try {
         ws.send(JSON.stringify(message));
         stream.lastEmitAt = new Date().toISOString();
+
+        // Update Redis state
+        await redis.updateStreamState(deviceId, {
+            currentIndex: stream.currentIndex
+        });
     } catch (error) {
         console.error(`Failed to send to device ${deviceId}:`, error.message);
-        pauseStream(deviceId);
+        await pauseStream(deviceId);
         return;
     }
 
@@ -140,11 +173,9 @@ function emitNextCoordinate(deviceId) {
     // Check if reached end
     if (stream.currentIndex >= stream.points.length) {
         if (stream.config.loop) {
-            // Reset to beginning
             stream.currentIndex = 0;
         } else {
-            // Stop streaming
-            stopStream(deviceId);
+            await stopStream(deviceId);
         }
     }
 }
@@ -154,7 +185,7 @@ function emitNextCoordinate(deviceId) {
  * @param {string} deviceId 
  * @returns {Object|null}
  */
-function pauseStream(deviceId) {
+async function pauseStream(deviceId) {
     const stream = activeStreams.get(deviceId);
     if (!stream) return null;
 
@@ -164,6 +195,17 @@ function pauseStream(deviceId) {
     }
 
     stream.status = 'paused';
+
+    // Update PostgreSQL
+    if (stream.dbId) {
+        await prisma.stream.update({
+            where: { id: stream.dbId },
+            data: { status: 'PAUSED' }
+        });
+    }
+
+    // Update Redis
+    await redis.updateStreamState(deviceId, { status: 'paused' });
 
     return {
         deviceId,
@@ -178,11 +220,22 @@ function pauseStream(deviceId) {
  * @param {string} deviceId 
  * @returns {Object|null}
  */
-function resumeStream(deviceId) {
+async function resumeStream(deviceId) {
     const stream = activeStreams.get(deviceId);
     if (!stream || stream.status !== 'paused') return null;
 
     stream.status = 'running';
+
+    // Update PostgreSQL
+    if (stream.dbId) {
+        await prisma.stream.update({
+            where: { id: stream.dbId },
+            data: { status: 'STARTED' }
+        });
+    }
+
+    // Update Redis
+    await redis.updateStreamState(deviceId, { status: 'running' });
 
     stream.intervalId = setInterval(() => {
         emitNextCoordinate(deviceId);
@@ -204,13 +257,27 @@ function resumeStream(deviceId) {
  * @param {string} deviceId 
  * @returns {Object|null}
  */
-function stopStream(deviceId) {
+async function stopStream(deviceId) {
     const stream = activeStreams.get(deviceId);
     if (!stream) return null;
 
     if (stream.intervalId) {
         clearInterval(stream.intervalId);
     }
+
+    // Update PostgreSQL
+    if (stream.dbId) {
+        await prisma.stream.update({
+            where: { id: stream.dbId },
+            data: {
+                status: 'STOPPED',
+                stoppedAt: new Date()
+            }
+        });
+    }
+
+    // Delete Redis state
+    await redis.deleteStreamState(deviceId);
 
     const result = {
         deviceId,
@@ -229,20 +296,36 @@ function stopStream(deviceId) {
  * @param {string} deviceId 
  * @returns {Object|null}
  */
-function getStreamStatus(deviceId) {
+async function getStreamStatus(deviceId) {
+    // First check in-memory
     const stream = activeStreams.get(deviceId);
-    if (!stream) return null;
+    if (stream) {
+        return {
+            deviceId,
+            routeId: stream.routeId,
+            status: stream.status,
+            currentIndex: stream.currentIndex,
+            totalPoints: stream.points.length,
+            config: stream.config,
+            startedAt: stream.startedAt,
+            lastEmitAt: stream.lastEmitAt
+        };
+    }
 
-    return {
-        deviceId,
-        routeId: stream.routeId,
-        status: stream.status,
-        currentIndex: stream.currentIndex,
-        totalPoints: stream.points.length,
-        config: stream.config,
-        startedAt: stream.startedAt,
-        lastEmitAt: stream.lastEmitAt
-    };
+    // Check Redis for hot state
+    const redisState = await redis.getStreamState(deviceId);
+    if (redisState) {
+        return {
+            deviceId,
+            routeId: redisState.routeId,
+            status: redisState.status,
+            currentIndex: redisState.currentIndex,
+            totalPoints: redisState.totalPoints,
+            fromRedis: true
+        };
+    }
+
+    return null;
 }
 
 /**
@@ -272,6 +355,25 @@ function hasActiveStream(deviceId) {
     return activeStreams.has(deviceId);
 }
 
+/**
+ * Get stream history for a device from PostgreSQL
+ * @param {string} deviceId 
+ * @param {number} limit 
+ * @returns {Array}
+ */
+async function getStreamHistory(deviceId, limit = 10) {
+    return prisma.stream.findMany({
+        where: { deviceId },
+        orderBy: { startedAt: 'desc' },
+        take: limit,
+        include: {
+            route: {
+                select: { name: true }
+            }
+        }
+    });
+}
+
 module.exports = {
     startStream,
     pauseStream,
@@ -279,5 +381,6 @@ module.exports = {
     stopStream,
     getStreamStatus,
     getAllStreams,
-    hasActiveStream
+    hasActiveStream,
+    getStreamHistory
 };

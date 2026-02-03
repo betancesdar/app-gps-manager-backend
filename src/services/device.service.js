@@ -1,56 +1,91 @@
 /**
  * Device Service
- * In-memory storage for devices
- * Ready for future DB integration
+ * PostgreSQL for persistence, Redis for WS authorization
+ * In-memory Map only for WebSocket connections (not serializable)
  */
 
 const { v4: uuidv4 } = require('uuid');
+const { prisma } = require('../lib/prisma');
+const redis = require('../lib/redis');
 
-// In-memory storage for devices
-// Map<deviceId, DeviceInfo>
-const devices = new Map();
-
-// Map to associate deviceId with WebSocket connection
+// In-memory storage for WebSocket connections only
 // Map<deviceId, WebSocket>
 const deviceConnections = new Map();
 
+// ═══════════════════════════════════════════════════════════════════
+// Device CRUD Operations (PostgreSQL)
+// ═══════════════════════════════════════════════════════════════════
+
 /**
- * Register a new device
+ * Register or update a device
  * @param {Object} deviceData - Device registration data
- * @returns {Object} Registered device
+ * @param {string} userId - User ID from JWT
+ * @returns {Object} Registered/updated device
  */
-function registerDevice(deviceData) {
+async function registerDevice(deviceData, userId) {
     const { deviceId, platform, appVersion } = deviceData;
+    const finalDeviceId = deviceId || uuidv4();
 
-    const device = {
-        deviceId: deviceId || uuidv4(),
-        platform: platform || 'android',
-        appVersion: appVersion || '1.0.0',
-        registeredAt: new Date().toISOString(),
-        lastSeenAt: new Date().toISOString(),
-        isConnected: false
-    };
-
-    devices.set(device.deviceId, device);
+    // Upsert device in PostgreSQL
+    const device = await prisma.device.upsert({
+        where: { deviceId: finalDeviceId },
+        update: {
+            platform: platform || 'android',
+            appVersion: appVersion || '1.0.0',
+            lastSeenAt: new Date()
+        },
+        create: {
+            deviceId: finalDeviceId,
+            userId,
+            platform: platform || 'android',
+            appVersion: appVersion || '1.0.0'
+        }
+    });
 
     return device;
 }
 
 /**
- * Get device by ID
+ * Get device by deviceId
  * @param {string} deviceId 
  * @returns {Object|null} Device or null
  */
-function getDevice(deviceId) {
-    return devices.get(deviceId) || null;
+async function getDevice(deviceId) {
+    return prisma.device.findUnique({
+        where: { deviceId },
+        include: {
+            user: {
+                select: { username: true, role: true }
+            }
+        }
+    });
 }
 
 /**
  * Get all devices
  * @returns {Array} List of devices
  */
-function getAllDevices() {
-    return Array.from(devices.values());
+async function getAllDevices() {
+    return prisma.device.findMany({
+        include: {
+            user: {
+                select: { username: true }
+            }
+        },
+        orderBy: { lastSeenAt: 'desc' }
+    });
+}
+
+/**
+ * Get devices for a specific user
+ * @param {string} userId 
+ * @returns {Array}
+ */
+async function getDevicesByUser(userId) {
+    return prisma.device.findMany({
+        where: { userId },
+        orderBy: { lastSeenAt: 'desc' }
+    });
 }
 
 /**
@@ -59,18 +94,20 @@ function getAllDevices() {
  * @param {Object} updateData 
  * @returns {Object|null} Updated device or null
  */
-function updateDevice(deviceId, updateData) {
-    const device = devices.get(deviceId);
-    if (!device) return null;
-
-    const updated = {
-        ...device,
-        ...updateData,
-        lastSeenAt: new Date().toISOString()
-    };
-
-    devices.set(deviceId, updated);
-    return updated;
+async function updateDevice(deviceId, updateData) {
+    try {
+        return await prisma.device.update({
+            where: { deviceId },
+            data: {
+                ...updateData,
+                lastSeenAt: new Date()
+            }
+        });
+    } catch (error) {
+        // Device not found
+        if (error.code === 'P2025') return null;
+        throw error;
+    }
 }
 
 /**
@@ -78,20 +115,97 @@ function updateDevice(deviceId, updateData) {
  * @param {string} deviceId 
  * @returns {boolean} Success
  */
-function deleteDevice(deviceId) {
-    // Also remove WebSocket connection
-    deviceConnections.delete(deviceId);
-    return devices.delete(deviceId);
+async function deleteDevice(deviceId) {
+    try {
+        // Also remove from Redis and in-memory
+        await redis.deleteWsAuth(deviceId);
+        await redis.deleteWsConnection(deviceId);
+        deviceConnections.delete(deviceId);
+
+        await prisma.device.delete({
+            where: { deviceId }
+        });
+        return true;
+    } catch (error) {
+        if (error.code === 'P2025') return false;
+        throw error;
+    }
 }
+
+/**
+ * Check if device exists
+ * @param {string} deviceId 
+ * @returns {boolean}
+ */
+async function deviceExists(deviceId) {
+    const count = await prisma.device.count({
+        where: { deviceId }
+    });
+    return count > 0;
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// WebSocket Authorization (Redis)
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * Authorize a device for WebSocket connection
+ * Stores authorization in Redis with TTL
+ * @param {string} deviceId 
+ * @param {string} userId 
+ * @param {string} token 
+ */
+async function authorizeDeviceForWS(deviceId, userId, token) {
+    await redis.setWsAuth(deviceId, userId, token);
+}
+
+/**
+ * Check if device is authorized for WebSocket
+ * @param {string} deviceId 
+ * @param {string} token 
+ * @returns {boolean}
+ */
+async function isDeviceAuthorizedForWS(deviceId, token) {
+    const auth = await redis.getWsAuth(deviceId);
+    if (!auth) return false;
+    return auth.token === token;
+}
+
+/**
+ * Get WS authorization info
+ * @param {string} deviceId 
+ * @returns {Object|null}
+ */
+async function getWsAuthorization(deviceId) {
+    return redis.getWsAuth(deviceId);
+}
+
+/**
+ * Refresh WS authorization TTL
+ * @param {string} deviceId 
+ */
+async function refreshWsAuthorization(deviceId) {
+    await redis.refreshWsAuth(deviceId);
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// WebSocket Connection Management (In-Memory + Redis Presence)
+// ═══════════════════════════════════════════════════════════════════
 
 /**
  * Associate a WebSocket connection with a device
  * @param {string} deviceId 
  * @param {WebSocket} ws 
  */
-function setDeviceConnection(deviceId, ws) {
+async function setDeviceConnection(deviceId, ws) {
+    // Store WS reference in memory (not serializable)
     deviceConnections.set(deviceId, ws);
-    updateDevice(deviceId, { isConnected: true });
+
+    // Set presence in Redis
+    await redis.setWsConnection(deviceId, process.env.HOSTNAME || 'local');
+
+    // Update PostgreSQL
+    await updateDevice(deviceId, { isConnected: true });
 }
 
 /**
@@ -107,28 +221,53 @@ function getDeviceConnection(deviceId) {
  * Remove WebSocket connection for a device
  * @param {string} deviceId 
  */
-function removeDeviceConnection(deviceId) {
+async function removeDeviceConnection(deviceId) {
     deviceConnections.delete(deviceId);
-    updateDevice(deviceId, { isConnected: false });
+
+    // Remove presence from Redis
+    await redis.deleteWsConnection(deviceId);
+
+    // Update PostgreSQL
+    await updateDevice(deviceId, { isConnected: false });
 }
 
 /**
- * Check if device exists
+ * Refresh WS connection TTL (called on ping)
  * @param {string} deviceId 
- * @returns {boolean}
  */
-function deviceExists(deviceId) {
-    return devices.has(deviceId);
+async function refreshDeviceConnection(deviceId) {
+    await redis.refreshWsConnection(deviceId);
+    await updateDevice(deviceId, {}); // Just updates lastSeenAt
+}
+
+/**
+ * Get all connected device IDs
+ * @returns {Array<string>}
+ */
+function getConnectedDeviceIds() {
+    return Array.from(deviceConnections.keys());
 }
 
 module.exports = {
+    // Device CRUD
     registerDevice,
     getDevice,
     getAllDevices,
+    getDevicesByUser,
     updateDevice,
     deleteDevice,
+    deviceExists,
+
+    // WS Authorization
+    authorizeDeviceForWS,
+    isDeviceAuthorizedForWS,
+    getWsAuthorization,
+    refreshWsAuthorization,
+
+    // WS Connections
     setDeviceConnection,
     getDeviceConnection,
     removeDeviceConnection,
-    deviceExists
+    refreshDeviceConnection,
+    getConnectedDeviceIds
 };
