@@ -191,10 +191,71 @@ async function deleteDevice(req, res) {
     }
 }
 
+/**
+ * PUT /api/devices/:deviceId/route
+ * Assign a route to a device
+ */
+async function assignRoute(req, res) {
+    try {
+        const { deviceId } = req.params;
+        const { routeId } = req.body;
+        const userId = req.user.userId;
+
+        if (!routeId) {
+            return res.status(400).json({
+                success: false,
+                error: 'routeId is required'
+            });
+        }
+
+        // Validate device exists
+        const deviceExists = await deviceService.deviceExists(deviceId);
+        if (!deviceExists) {
+            return res.status(404).json({
+                success: false,
+                error: 'Device not found'
+            });
+        }
+
+        // Assign route
+        const device = await deviceService.assignRouteToDevice(deviceId, routeId);
+
+        // Audit log
+        await auditService.log(auditService.ACTIONS.DEVICE_UPDATE, {
+            userId,
+            deviceId,
+            meta: { action: 'assign_route', routeId }
+        });
+
+        return res.status(200).json({
+            success: true,
+            message: 'Route assigned',
+            data: {
+                deviceId: device.deviceId,
+                assignedRoute: device.assignedRoute
+            }
+        });
+    } catch (error) {
+        console.error('Assign route error:', error);
+        // Check for foreign key constraint violation (invalid routeId)
+        if (error.code === 'P2003') {
+            return res.status(400).json({
+                success: false,
+                error: 'Route not found'
+            });
+        }
+        return res.status(500).json({
+            success: false,
+            error: 'Failed to assign route'
+        });
+    }
+}
+
 module.exports = {
     registerDevice,
     getAllDevices,
     getMyDevices,
     getDevice,
-    deleteDevice
+    deleteDevice,
+    assignRoute
 };

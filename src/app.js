@@ -13,6 +13,7 @@ const authRoutes = require('./routes/auth.routes');
 const deviceRoutes = require('./routes/device.routes');
 const routeRoutes = require('./routes/route.routes');
 const streamRoutes = require('./routes/stream.routes');
+const geocodeRoutes = require('./routes/geocode.routes');
 
 const app = express();
 
@@ -45,6 +46,7 @@ app.use('/api/auth', authRoutes);
 app.use('/api/devices', deviceRoutes);
 app.use('/api/routes', routeRoutes);
 app.use('/api/stream', streamRoutes);
+app.use('/api/geocode', geocodeRoutes);
 
 // 404 handler
 app.use((req, res) => {

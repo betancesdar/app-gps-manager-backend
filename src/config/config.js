@@ -32,5 +32,15 @@ module.exports = {
         accuracy: 5,         // meters
         intervalMs: 1000,    // emit every 1 second
         loop: false
-    }
+    },
+
+    // OpenRouteService (ORS)
+    ORS_API_KEY: process.env.ORS_API_KEY || '',
+    ORS_API_URL: process.env.ORS_API_URL || 'https://api.openrouteservice.org',
+    ORS_GEOCODING_CACHE_TTL: parseInt(process.env.ORS_GEOCODING_CACHE_TTL) || 86400, // 24 hours
+    ORS_DEFAULT_POINT_SPACING: parseInt(process.env.ORS_DEFAULT_POINT_SPACING) || 15, // meters
+
+    // Rate Limiting
+    RATE_LIMIT_ADDRESSES: parseInt(process.env.RATE_LIMIT_ADDRESSES) || 20, // requests per minute
+    RATE_LIMIT_WINDOW: parseInt(process.env.RATE_LIMIT_WINDOW) || 60 // seconds
 };

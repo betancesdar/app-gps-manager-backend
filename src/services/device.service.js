@@ -33,6 +33,7 @@ async function registerDevice(deviceData, userId) {
             platform: platform || 'android',
             appVersion: appVersion || '1.0.0',
             lastSeenAt: new Date()
+            // assignedRouteId is preserved automatically by not including it here
         },
         create: {
             deviceId: finalDeviceId,
@@ -56,6 +57,9 @@ async function getDevice(deviceId) {
         include: {
             user: {
                 select: { username: true, role: true }
+            },
+            assignedRoute: {
+                select: { id: true, name: true }
             }
         }
     });
@@ -142,6 +146,27 @@ async function deviceExists(deviceId) {
         where: { deviceId }
     });
     return count > 0;
+}
+
+/**
+ * Assign a route to a device
+ * @param {string} deviceId 
+ * @param {string} routeId 
+ * @returns {Object} Updated device
+ */
+async function assignRouteToDevice(deviceId, routeId) {
+    return prisma.device.update({
+        where: { deviceId },
+        data: {
+            assignedRouteId: routeId,
+            lastSeenAt: new Date()
+        },
+        include: {
+            assignedRoute: {
+                select: { id: true, name: true }
+            }
+        }
+    });
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -257,6 +282,7 @@ module.exports = {
     updateDevice,
     deleteDevice,
     deviceExists,
+    assignRouteToDevice,
 
     // WS Authorization
     authorizeDeviceForWS,

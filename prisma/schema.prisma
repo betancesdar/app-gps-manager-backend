@@ -48,6 +48,8 @@ model Device {
   user         User      @relation(fields: [userId], references: [id])
   streams      Stream[]
   auditLogs    AuditLog[]
+  assignedRoute Route?   @relation("DeviceAssignedRoute", fields: [assignedRouteId], references: [id])
+  assignedRouteId String? @map("assigned_route_id")
 
   @@map("devices")
 }
@@ -67,6 +69,7 @@ model Route {
   user       User         @relation(fields: [userId], references: [id])
   points     RoutePoint[]
   streams    Stream[]
+  assignedDevices Device[]  @relation("DeviceAssignedRoute")
 
   @@map("routes")
 }

@@ -22,4 +22,7 @@ router.get('/:deviceId', deviceController.getDevice);
 // DELETE /api/devices/:deviceId
 router.delete('/:deviceId', deviceController.deleteDevice);
 
+// PUT /api/devices/:deviceId/route
+router.put('/:deviceId/route', deviceController.assignRoute);
+
 module.exports = router;

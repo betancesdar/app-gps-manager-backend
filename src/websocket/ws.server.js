@@ -14,6 +14,23 @@ const auditService = require('../services/audit.service');
 // This is CRITICAL - prevents Express from intercepting /ws
 const wss = new WebSocketServer({ noServer: true });
 
+/**
+ * Broadcast message to all connected clients (dashboards)
+ * @param {string} type 
+ * @param {Object} payload 
+ */
+function broadcast(type, payload) {
+    wss.clients.forEach(client => {
+        if (client.readyState === 1) { // OPEN
+            client.send(JSON.stringify({
+                type,
+                payload,
+                timestamp: new Date().toISOString()
+            }));
+        }
+    });
+}
+
 // Handle WebSocket connections
 wss.on('connection', async (ws, req) => {
     // Read token and deviceId from HEADERS
@@ -113,6 +130,9 @@ wss.on('connection', async (ws, req) => {
         });
 
         console.log(`✅ Device ${deviceId} connected via WebSocket`);
+
+        // Broadcast to dashboards
+        broadcast('DEVICE_CONNECTED', { deviceId, ip: clientIp });
     } catch (error) {
         console.error(`❌ Failed to set device connection:`, error.message);
         ws.close(4500, 'internal error');
@@ -178,6 +198,13 @@ wss.on('connection', async (ws, req) => {
                 deviceId,
                 meta: { code, reason: reason?.toString() }
             });
+
+            // Broadcast to dashboards
+            broadcast('DEVICE_DISCONNECTED', {
+                deviceId,
+                code,
+                reason: reason?.toString()
+            });
         } catch (error) {
             console.error(`⚠️ Error handling disconnect:`, error.message);
         }
@@ -199,4 +226,4 @@ wss.on('connection', async (ws, req) => {
 
 console.log('📡 WebSocket server initialized (noServer mode with Redis + PostgreSQL validation)');
 
-module.exports = { wss };
+module.exports = { wss, broadcast };

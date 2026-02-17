@@ -5,7 +5,11 @@
 
 const routeService = require('../services/route.service');
 const auditService = require('../services/audit.service');
+const orsService = require('../services/ors.service');
 const { parseGPX, validateCoordinates } = require('../utils/gpx.parser');
+const geospatialUtil = require('../utils/geospatial.util');
+const { resamplePoints, calculateBearing } = geospatialUtil;
+const config = require('../config/config');
 
 /**
  * POST /api/routes/from-points
@@ -15,6 +19,14 @@ async function createFromPoints(req, res) {
     try {
         const { name, points } = req.body;
         const userId = req.user?.userId;
+
+        // Validate user is authenticated
+        if (!userId) {
+            return res.status(401).json({
+                success: false,
+                error: 'User not authenticated'
+            });
+        }
 
         if (!points || !Array.isArray(points) || points.length < 2) {
             return res.status(400).json({
@@ -61,6 +73,14 @@ async function createFromGPX(req, res) {
         const { name, gpxContent } = req.body;
         const userId = req.user?.userId;
 
+        // Validate user is authenticated
+        if (!userId) {
+            return res.status(401).json({
+                success: false,
+                error: 'User not authenticated'
+            });
+        }
+
         if (!gpxContent) {
             return res.status(400).json({
                 success: false,
@@ -98,6 +118,367 @@ async function createFromGPX(req, res) {
         return res.status(500).json({
             success: false,
             error: error.message || 'Failed to parse GPX'
+        });
+    }
+}
+
+/**
+ * POST /api/routes/from-addresses
+ * Create route from origin and destination addresses using OpenRouteService
+ */
+async function createFromAddresses(req, res) {
+    try {
+        const {
+            name,
+            originText,
+            destinationText,
+            profile = 'driving-car',
+            pointSpacingMeters,
+            waitAtEndSeconds = 0
+        } = req.body;
+
+        const userId = req.user?.userId;
+
+        // Validate user is authenticated
+        if (!userId) {
+            return res.status(401).json({
+                success: false,
+                error: 'User not authenticated'
+            });
+        }
+
+        // Validate required fields
+        if (!originText || !destinationText) {
+            return res.status(400).json({
+                success: false,
+                error: 'originText and destinationText are required'
+            });
+        }
+
+        // Validate point spacing
+        const spacing = pointSpacingMeters || config.ORS_DEFAULT_POINT_SPACING;
+        if (spacing <= 0 || spacing > 1000) {
+            return res.status(400).json({
+                success: false,
+                error: 'pointSpacingMeters must be between 1 and 1000'
+            });
+        }
+
+        console.log(`[RouteController] Creating route from addresses: "${originText}" -> "${destinationText}"`);
+
+        // Step 1: Geocode origin and destination
+        let origin, destination;
+        try {
+            origin = await orsService.geocodeAddress(originText);
+            destination = await orsService.geocodeAddress(destinationText);
+        } catch (geocodeError) {
+            return res.status(400).json({
+                success: false,
+                error: `Geocoding failed: ${geocodeError.message}`
+            });
+        }
+
+        console.log(`[RouteController] Geocoded: Origin(${origin.lat}, ${origin.lng}), Destination(${destination.lat}, ${destination.lng})`);
+
+        // Step 2: Get directions from ORS
+        let directionsResult;
+        try {
+            directionsResult = await orsService.getDirections(origin, destination, profile);
+        } catch (directionsError) {
+            return res.status(502).json({
+                success: false,
+                error: `Directions service failed: ${directionsError.message}`
+            });
+        }
+
+        const { geometry, distanceMeters, durationSeconds } = directionsResult;
+
+        console.log(`[RouteController] Route calculated: ${distanceMeters}m, ${durationSeconds}s, ${geometry.length} raw points`);
+
+        // Step 3: Resample points for smooth mock location
+        let resampledPoints;
+        try {
+            resampledPoints = resamplePoints(geometry, spacing);
+        } catch (resampleError) {
+            return res.status(500).json({
+                success: false,
+                error: `Point resampling failed: ${resampleError.message}`
+            });
+        }
+
+        console.log(`[RouteController] Resampled to ${resampledPoints.length} points at ${spacing}m spacing`);
+
+        // Step 4: Calculate bearing for each point
+        const pointsWithMetadata = resampledPoints.map((point, index) => {
+            const nextPoint = index < resampledPoints.length - 1
+                ? resampledPoints[index + 1]
+                : null;
+
+            return {
+                lat: point.lat,
+                lng: point.lng,
+                bearing: nextPoint ? calculateBearing(point, nextPoint) : null,
+                speed: null, // Will be determined by stream config
+                accuracy: null
+            };
+        });
+
+        // Step 5: Add wait duration to last point if specified
+        if (waitAtEndSeconds > 0 && pointsWithMetadata.length > 0) {
+            pointsWithMetadata[pointsWithMetadata.length - 1].waitDuration = waitAtEndSeconds;
+        }
+
+        // Step 6: Create route in database
+        const route = await routeService.createRoute(
+            {
+                name: name || `${originText} → ${destinationText}`,
+                points: pointsWithMetadata,
+                sourceType: 'ors'
+            },
+            userId
+        );
+
+        // Step 7: Audit log
+        await auditService.log(auditService.ACTIONS.ROUTE_CREATE, {
+            userId,
+            meta: {
+                routeId: route.routeId,
+                name: route.name,
+                pointCount: pointsWithMetadata.length,
+                source: 'ors',
+                profile,
+                distanceMeters,
+                durationSeconds,
+                originText,
+                destinationText
+            }
+        });
+
+        console.log(`[RouteController] ✅ Route created: ${route.routeId}`);
+
+        return res.status(201).json({
+            success: true,
+            message: 'Route created from addresses',
+            data: {
+                routeId: route.routeId,
+                name: route.name,
+                distanceM: Math.round(distanceMeters),
+                durationS: Math.round(durationSeconds),
+                pointsCount: pointsWithMetadata.length,
+                pointSpacingMeters: spacing
+            }
+        });
+
+    } catch (error) {
+        console.error('[RouteController] Create route from addresses error:', error);
+        return res.status(500).json({
+            success: false,
+            error: error.message || 'Failed to create route from addresses'
+        });
+    }
+}
+/**
+ * POST /api/routes/from-addresses-with-stops
+ * Create route from multiple stops (addresses or manual coords)
+ * with optional wait times and point spacing
+ */
+async function createFromAddressesWithStops(req, res) {
+    try {
+        const {
+            name,
+            stops,
+            profile = 'driving-car',
+            pointSpacingMeters
+        } = req.body;
+
+        const userId = req.user?.userId;
+
+        // Validate user is authenticated
+        if (!userId) {
+            return res.status(401).json({
+                success: false,
+                error: 'User not authenticated'
+            });
+        }
+
+        // Validate stops
+        if (!stops || !Array.isArray(stops) || stops.length < 2) {
+            return res.status(400).json({
+                success: false,
+                error: 'At least 2 stops are required'
+            });
+        }
+
+        // Validate point spacing
+        const spacing = pointSpacingMeters || config.ORS_DEFAULT_POINT_SPACING;
+        if (spacing <= 0 || spacing > 1000) {
+            return res.status(400).json({
+                success: false,
+                error: 'pointSpacingMeters must be between 1 and 1000'
+            });
+        }
+
+        console.log(`[RouteController] Creating route with ${stops.length} stops`);
+
+        // Step 1: Resolve all stops to coordinates
+        const resolvedStops = [];
+        for (let i = 0; i < stops.length; i++) {
+            const stop = stops[i];
+            let coords;
+
+            if (stop.lat !== undefined && stop.lng !== undefined) {
+                // Manual coordinates
+                coords = { lat: parseFloat(stop.lat), lng: parseFloat(stop.lng) };
+                if (isNaN(coords.lat) || isNaN(coords.lng)) {
+                    return res.status(400).json({
+                        success: false,
+                        error: `Invalid coordinates at stop ${i + 1}`
+                    });
+                }
+            } else if (stop.text) {
+                // Address to geocode
+                try {
+                    coords = await orsService.geocodeAddress(stop.text);
+                } catch (err) {
+                    return res.status(400).json({
+                        success: false,
+                        error: `Geocoding failed for stop ${i + 1} ("${stop.text}"): ${err.message}`
+                    });
+                }
+            } else {
+                return res.status(400).json({
+                    success: false,
+                    error: `Stop ${i + 1} must have either lat/lng or text`
+                });
+            }
+
+            resolvedStops.push({
+                ...coords,
+                waitSeconds: stop.waitSeconds || 0,
+                label: stop.label || stop.text || `Stop ${i + 1}`
+            });
+        }
+
+        // Step 2: Build route segments
+        let allPoints = [];
+        let totalDistance = 0;
+        let totalDuration = 0;
+
+        for (let i = 0; i < resolvedStops.length - 1; i++) {
+            const start = resolvedStops[i];
+            const end = resolvedStops[i + 1];
+
+            console.log(`[RouteController] Fetching segment ${i + 1}: ${start.label} -> ${end.label}`);
+
+            let segmentResult;
+            try {
+                segmentResult = await orsService.getDirections(start, end, profile);
+            } catch (err) {
+                return res.status(502).json({
+                    success: false,
+                    error: `Directions failed for segment ${i + 1}: ${err.message}`
+                });
+            }
+
+            const { geometry, distanceMeters, durationSeconds } = segmentResult;
+            totalDistance += distanceMeters;
+            totalDuration += durationSeconds;
+
+            // Resample points
+            let resampledSeg = resamplePoints(geometry, spacing);
+
+            // Calculate bearing
+            resampledSeg = resampledSeg.map((p, idx) => {
+                const next = idx < resampledSeg.length - 1 ? resampledSeg[idx + 1] : null;
+                return {
+                    lat: p.lat,
+                    lng: p.lng,
+                    bearing: next ? calculateBearing(p, next) : (allPoints.length > 0 ? allPoints[allPoints.length - 1].bearing : 0),
+                    speed: null,
+                    accuracy: null
+                };
+            });
+
+            // Prevent duplicate points at joins (except for the very first point of the route)
+            // If allPoints is not empty, and the first point of this segment matches the last of allPoints, skip it.
+            // However, ORS might return slightly different coords for the same place?
+            // Safer: Just allow it or filter if distance is 0.
+            // For simplicity and "clean" routes, let's keep all resampled points but the join might have tiny overlaps.
+            // Actually, we should probably strip the first point of the segment IF it's not the first segment
+            if (i > 0) {
+                // Reuse the last point of previous segment to ensure continuity?
+                // Or just append. Appending is safer to avoid gaps.
+            }
+
+            // Append segment points
+            allPoints = allPoints.concat(resampledSeg);
+
+            // Handle WAIT at the END of this segment (which is 'end' stop)
+            // If end.waitSeconds > 0, we duplicate the last point
+            if (end.waitSeconds > 0) {
+                const lastPoint = resampledSeg[resampledSeg.length - 1];
+                // Assume 1 second per tick for generic playback representation
+                // User requirement: "repeats = ceil(waitSeconds * 1000 / tickMs)"
+                // We assume tickMs = 1000 for storage estimation
+                const repeats = Math.ceil(end.waitSeconds);
+
+                console.log(`[RouteController] Adding ${repeats} wait points at ${end.label}`);
+                for (let r = 0; r < repeats; r++) {
+                    allPoints.push({
+                        ...lastPoint,
+                        speed: 0 // Explicitly 0 speed for wait
+                    });
+                }
+
+                // Add wait duration to totals
+                totalDuration += end.waitSeconds;
+            }
+        }
+
+        console.log(`[RouteController] Total route: ${Math.round(totalDistance)}m, ${allPoints.length} points`);
+
+        // Step 3: Persist
+        const route = await routeService.createRoute(
+            {
+                name: name || `${resolvedStops[0].label} -> ${resolvedStops[resolvedStops.length - 1].label}`,
+                points: allPoints,
+                sourceType: 'ors_stops'
+            },
+            userId
+        );
+
+        // Step 4: Audit log
+        await auditService.log(auditService.ACTIONS.ROUTE_CREATE, {
+            userId,
+            meta: {
+                routeId: route.routeId,
+                name: route.name,
+                pointCount: allPoints.length,
+                source: 'ors_stops',
+                stopCount: stops.length,
+                totalDistance,
+                totalDuration
+            }
+        });
+
+        return res.status(201).json({
+            success: true,
+            message: 'Route with stops created',
+            data: {
+                routeId: route.routeId,
+                name: route.name,
+                distanceM: Math.round(totalDistance),
+                durationS: Math.round(totalDuration),
+                pointsCount: allPoints.length,
+                pointSpacingMeters: spacing
+            }
+        });
+
+    } catch (error) {
+        console.error('[RouteController] Create route with stops error:', error);
+        return res.status(500).json({
+            success: false,
+            error: error.message || 'Failed to create route with stops'
         });
     }
 }
@@ -238,6 +619,8 @@ async function deleteRoute(req, res) {
 module.exports = {
     createFromPoints,
     createFromGPX,
+    createFromAddresses,
+    createFromAddressesWithStops,
     getAllRoutes,
     getRoute,
     updateRouteConfig,

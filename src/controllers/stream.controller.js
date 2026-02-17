@@ -8,6 +8,7 @@ const streamService = require('../services/stream.service');
 const deviceService = require('../services/device.service');
 const routeService = require('../services/route.service');
 const auditService = require('../services/audit.service');
+const { broadcast } = require('../websocket/ws.server');
 
 /**
  * POST /api/stream/start
@@ -15,23 +16,36 @@ const auditService = require('../services/audit.service');
  */
 async function startStream(req, res) {
     try {
-        const { deviceId, routeId, speed, accuracy, loop, intervalMs } = req.body;
+        let { deviceId, routeId, speed, accuracy, loop, intervalMs } = req.body;
         const userId = req.user?.userId;
 
-        if (!deviceId || !routeId) {
+        if (!deviceId) {
             return res.status(400).json({
                 success: false,
-                error: 'deviceId and routeId are required'
+                error: 'deviceId is required'
             });
         }
 
         // Validate device exists
-        const deviceExists = await deviceService.deviceExists(deviceId);
-        if (!deviceExists) {
+        const device = await deviceService.getDevice(deviceId);
+        if (!device) {
             return res.status(404).json({
                 success: false,
                 error: 'Device not found'
             });
+        }
+
+        // If routeId is missing, check assigned route
+        if (!routeId) {
+            if (device.assignedRouteId) {
+                routeId = device.assignedRouteId;
+                console.log(`Using assigned route ${routeId} for device ${deviceId}`);
+            } else {
+                return res.status(400).json({
+                    success: false,
+                    error: 'routeId is required or device must have an assigned route'
+                });
+            }
         }
 
         // Validate route exists
@@ -56,6 +70,14 @@ async function startStream(req, res) {
             userId,
             deviceId,
             meta: { routeId, options }
+        });
+
+        // Broadcast stream started
+        broadcast('STREAM_STARTED', {
+            deviceId,
+            routeId,
+            speed: stream.config.speed,
+            loop: stream.config.loop
         });
 
         return res.status(200).json({
@@ -192,6 +214,9 @@ async function stopStream(req, res) {
             userId,
             deviceId
         });
+
+        // Broadcast stream stopped
+        broadcast('STREAM_STOPPED', { deviceId });
 
         return res.status(200).json({
             success: true,
