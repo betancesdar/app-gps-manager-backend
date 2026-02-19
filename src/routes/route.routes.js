@@ -23,6 +23,10 @@ router.post('/from-addresses', rateLimitAddresses, routeController.createFromAdd
 // POST /api/routes/from-addresses-with-stops
 router.post('/from-addresses-with-stops', routeController.createFromAddressesWithStops);
 
+// POST /api/routes/from-waypoints (with rate limiting)
+router.post('/from-waypoints', rateLimitAddresses, routeController.createFromWaypoints);
+
+
 // GET /api/routes
 router.get('/', routeController.getAllRoutes);
 

@@ -1,38 +1,34 @@
 /**
  * Device Controller
- * Handles device registration and management with PostgreSQL + Redis
+ * Handles device registration, management, and enrollment
  */
 
 const deviceService = require('../services/device.service');
 const auditService = require('../services/audit.service');
+const routeService = require('../services/route.service');
 
 /**
  * POST /api/devices/register
- * Register a new device
+ * Register a new device (Idempotent)
  */
 async function registerDevice(req, res) {
     try {
         const { deviceId, platform, appVersion } = req.body;
         const userId = req.user.userId; // From JWT middleware
 
-        // Get token from Authorization header
-        const authHeader = req.headers.authorization;
-        if (!authHeader) {
-            return res.status(401).json({
-                success: false,
-                error: 'Missing token'
-            });
-        }
-        const token = authHeader.replace('Bearer ', '');
-
-        // Upsert device in PostgreSQL
+        // Strict validation handled by service now, but we catch it here
         const device = await deviceService.registerDevice(
             { deviceId, platform, appVersion },
             userId
         );
 
-        // Authorize device for WebSocket in Redis (TTL 15 min)
-        await deviceService.authorizeDeviceForWS(device.deviceId, userId, token);
+        // Authorize for WS (Legacy flow: user token)
+        // If client sends token, we cache it in Redis for WS auth
+        const authHeader = req.headers.authorization;
+        if (authHeader) {
+            const token = authHeader.replace('Bearer ', '');
+            await deviceService.authorizeDeviceForWS(device.deviceId, userId, token);
+        }
 
         // Audit log
         await auditService.log(auditService.ACTIONS.DEVICE_REGISTER, {
@@ -41,9 +37,8 @@ async function registerDevice(req, res) {
             meta: { platform, appVersion, ip: req.ip }
         });
 
-        return res.status(201).json({
+        return res.status(200).json({
             success: true,
-            message: 'Device registered',
             data: {
                 deviceId: device.deviceId,
                 platform: device.platform,
@@ -54,6 +49,12 @@ async function registerDevice(req, res) {
             }
         });
     } catch (error) {
+        if (error.code === 'MISSING_DEVICE_ID') {
+            return res.status(400).json({
+                success: false,
+                error: 'deviceId is required'
+            });
+        }
         console.error('Register device error:', error);
         return res.status(500).json({
             success: false,
@@ -64,11 +65,28 @@ async function registerDevice(req, res) {
 
 /**
  * GET /api/devices
- * Get all registered devices
+ * Get all devices (Admin)
+ * Supports ?activeWithinSeconds=600
+ * Sorts: Connected > Disconnected
  */
 async function getAllDevices(req, res) {
     try {
-        const devices = await deviceService.getAllDevices();
+        const { activeWithinSeconds } = req.query;
+        let devices = await deviceService.getAllDevices();
+
+        // Filter
+        if (activeWithinSeconds) {
+            const cutoff = new Date(Date.now() - parseInt(activeWithinSeconds) * 1000);
+            devices = devices.filter(d => new Date(d.lastSeenAt) > cutoff);
+        }
+
+        // Sort: Connected first, then by Last Seen
+        devices.sort((a, b) => {
+            if (a.isConnected === b.isConnected) {
+                return new Date(b.lastSeenAt) - new Date(a.lastSeenAt);
+            }
+            return a.isConnected ? -1 : 1;
+        });
 
         return res.status(200).json({
             success: true,
@@ -79,7 +97,8 @@ async function getAllDevices(req, res) {
                 registeredAt: d.registeredAt,
                 lastSeenAt: d.lastSeenAt,
                 isConnected: d.isConnected,
-                user: d.user?.username
+                user: d.user?.username,
+                label: d.label // Include label
             })),
             count: devices.length
         });
@@ -87,7 +106,7 @@ async function getAllDevices(req, res) {
         console.error('Get devices error:', error);
         return res.status(500).json({
             success: false,
-            error: 'Failed to get devices'
+            error: 'Failed to fetch devices'
         });
     }
 }
@@ -117,7 +136,7 @@ async function getMyDevices(req, res) {
 
 /**
  * GET /api/devices/:deviceId
- * Get device by ID
+ * Get device details
  */
 async function getDevice(req, res) {
     try {
@@ -131,23 +150,15 @@ async function getDevice(req, res) {
             });
         }
 
-        return res.status(200).json({
+        res.json({
             success: true,
-            data: {
-                deviceId: device.deviceId,
-                platform: device.platform,
-                appVersion: device.appVersion,
-                registeredAt: device.registeredAt,
-                lastSeenAt: device.lastSeenAt,
-                isConnected: device.isConnected,
-                user: device.user?.username
-            }
+            data: device
         });
     } catch (error) {
         console.error('Get device error:', error);
-        return res.status(500).json({
+        res.status(500).json({
             success: false,
-            error: 'Failed to get device'
+            error: 'Failed to fetch device'
         });
     }
 }
@@ -159,32 +170,27 @@ async function getDevice(req, res) {
 async function deleteDevice(req, res) {
     try {
         const { deviceId } = req.params;
-        const userId = req.user.userId;
+        const success = await deviceService.deleteDevice(deviceId);
 
-        const exists = await deviceService.deviceExists(deviceId);
-        if (!exists) {
+        if (!success) {
             return res.status(404).json({
                 success: false,
                 error: 'Device not found'
             });
         }
 
-        await deviceService.deleteDevice(deviceId);
-
-        // Audit log
         await auditService.log(auditService.ACTIONS.DEVICE_DELETE, {
-            userId,
-            deviceId,
-            meta: { ip: req.ip }
+            userId: req.user.userId,
+            deviceId
         });
 
-        return res.status(200).json({
+        res.json({
             success: true,
             message: 'Device deleted'
         });
     } catch (error) {
         console.error('Delete device error:', error);
-        return res.status(500).json({
+        res.status(500).json({
             success: false,
             error: 'Failed to delete device'
         });
@@ -199,7 +205,6 @@ async function assignRoute(req, res) {
     try {
         const { deviceId } = req.params;
         const { routeId } = req.body;
-        const userId = req.user.userId;
 
         if (!routeId) {
             return res.status(400).json({
@@ -208,7 +213,16 @@ async function assignRoute(req, res) {
             });
         }
 
-        // Validate device exists
+        // Verify route exists
+        const route = await routeService.getRoute(routeId);
+        if (!route) {
+            return res.status(404).json({
+                success: false,
+                error: 'Route not found'
+            });
+        }
+
+        // Verify device exists
         const deviceExists = await deviceService.deviceExists(deviceId);
         if (!deviceExists) {
             return res.status(404).json({
@@ -217,45 +231,101 @@ async function assignRoute(req, res) {
             });
         }
 
-        // Assign route
         const device = await deviceService.assignRouteToDevice(deviceId, routeId);
 
-        // Audit log
         await auditService.log(auditService.ACTIONS.DEVICE_UPDATE, {
-            userId,
+            userId: req.user.userId,
             deviceId,
-            meta: { action: 'assign_route', routeId }
+            meta: { action: 'ASSIGN_ROUTE', routeId }
         });
 
-        return res.status(200).json({
+        res.json({
             success: true,
-            message: 'Route assigned',
-            data: {
-                deviceId: device.deviceId,
-                assignedRoute: device.assignedRoute
-            }
+            data: device
         });
     } catch (error) {
         console.error('Assign route error:', error);
-        // Check for foreign key constraint violation (invalid routeId)
-        if (error.code === 'P2003') {
-            return res.status(400).json({
-                success: false,
-                error: 'Route not found'
-            });
-        }
-        return res.status(500).json({
+        res.status(500).json({
             success: false,
             error: 'Failed to assign route'
         });
     }
 }
 
+// ── Enrollment Endpoints (Redis) ─────────────────────────────────────
+
+/**
+ * POST /api/devices/enroll
+ * Generate enrollment code (Admin)
+ */
+async function enroll(req, res) {
+    try {
+        // req.body: { label?, requestedDeviceId? }
+        const result = await deviceService.createEnrollment(req.user, req.body);
+        res.json({
+            success: true,
+            data: result
+        });
+    } catch (error) {
+        console.error('Enroll error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+}
+
+/**
+ * POST /api/devices/activate (or /enroll/confirm)
+ * Exchange code for device token (Public)
+ */
+async function confirm(req, res) {
+    try {
+        // req.body: { enrollmentCode, platform, appVersion, deviceInfo... }
+        const { enrollmentCode } = req.body;
+        if (!enrollmentCode) return res.status(400).json({ success: false, error: 'enrollmentCode required' });
+
+        const result = await deviceService.confirmEnrollment(enrollmentCode, req.body);
+
+        res.json({
+            success: true,
+            data: result
+        });
+    } catch (error) {
+        console.error('Confirm enrollment error:', error);
+        res.status(400).json({ success: false, error: error.message || 'Confirmation failed' });
+    }
+}
+
+// Alias for backward compatibility if needed, but new flow uses confirm
+const activate = confirm;
+
+/**
+ * POST /api/devices/cleanup-stale
+ * Delete stale devices (Admin)
+ */
+async function cleanup(req, res) {
+    try {
+        const { olderThanSeconds } = req.body;
+        const seconds = parseInt(olderThanSeconds) || 86400 * 30; // default 30 days
+
+        const count = await deviceService.cleanupStaleDevices(seconds);
+
+        res.json({
+            success: true,
+            data: { deletedCount: count, matchCriteria: 'inactive AND no active streams' }
+        });
+    } catch (error) {
+        console.error('Cleanup error:', error);
+        res.status(500).json({ success: false, error: error.message });
+    }
+}
+
 module.exports = {
     registerDevice,
     getAllDevices,
-    getMyDevices,
+    getMyDevices, // Kept for backward compat
     getDevice,
     deleteDevice,
-    assignRoute
+    assignRoute,
+    enroll,
+    activate,
+    cleanup
 };

@@ -44,7 +44,8 @@ async function createRoute(routeData, userId) {
                     lng: parseFloat(p.lng),
                     speed: p.speed ? parseFloat(p.speed) : null,
                     bearing: p.bearing ? parseFloat(p.bearing) : null,
-                    accuracy: p.accuracy ? parseFloat(p.accuracy) : null
+                    accuracy: p.accuracy ? parseFloat(p.accuracy) : null,
+                    dwellSeconds: p.dwellSeconds ? parseInt(p.dwellSeconds) : 0
                 }))
             }
         },
@@ -59,6 +60,78 @@ async function createRoute(routeData, userId) {
 }
 
 /**
+ * Create a route with named waypoints (origin/stop/destination) and dwell times.
+ * Persists route_points (with dwellSeconds) and route_waypoints in a single transaction.
+ * @param {Object} routeData - { name, points, waypoints, sourceType }
+ * @param {string} userId
+ * @returns {Object} Created route with waypoints
+ */
+async function createRouteWithWaypoints(routeData, userId) {
+    const { name, points, waypoints, sourceType = 'ors_waypoints' } = routeData;
+
+    if (!validateCoordinates(points)) {
+        throw new Error('Invalid coordinates');
+    }
+
+    if (!waypoints || !Array.isArray(waypoints) || waypoints.length < 2) {
+        throw new Error('At least 2 waypoints are required');
+    }
+
+    // Prepare route config with defaults
+    const routeConfig = {
+        speed: config.STREAM_DEFAULTS.speed,
+        accuracy: config.STREAM_DEFAULTS.accuracy,
+        intervalMs: config.STREAM_DEFAULTS.intervalMs,
+        loop: config.STREAM_DEFAULTS.loop,
+        pauses: []
+    };
+
+    // Create route + points + waypoints in a single transaction
+    const route = await prisma.route.create({
+        data: {
+            userId,
+            name: name || `Route ${uuidv4().substring(0, 8)}`,
+            sourceType,
+            config: routeConfig,
+            points: {
+                create: points.map((p, index) => ({
+                    seq: index,
+                    lat: parseFloat(p.lat),
+                    lng: parseFloat(p.lng),
+                    speed: p.speed ? parseFloat(p.speed) : null,
+                    bearing: p.bearing ? parseFloat(p.bearing) : null,
+                    accuracy: p.accuracy ? parseFloat(p.accuracy) : null,
+                    dwellSeconds: p.dwellSeconds ? parseInt(p.dwellSeconds) : 0
+                }))
+            },
+            waypoints: {
+                create: waypoints.map((wp, index) => ({
+                    seq: index,
+                    kind: wp.kind,
+                    mode: wp.mode,
+                    label: wp.label || null,
+                    text: wp.text || null,
+                    lat: parseFloat(wp.lat),
+                    lng: parseFloat(wp.lng),
+                    dwellSeconds: parseInt(wp.dwellSeconds) || 0,
+                    pointIndex: parseInt(wp.pointIndex) || 0
+                }))
+            }
+        },
+        include: {
+            points: {
+                orderBy: { seq: 'asc' }
+            },
+            waypoints: {
+                orderBy: { seq: 'asc' }
+            }
+        }
+    });
+
+    return formatRouteResponseWithWaypoints(route);
+}
+
+/**
  * Get route by ID with points
  * @param {string} routeId 
  * @returns {Object|null}
@@ -69,12 +142,15 @@ async function getRoute(routeId) {
         include: {
             points: {
                 orderBy: { seq: 'asc' }
+            },
+            waypoints: {
+                orderBy: { seq: 'asc' }
             }
         }
     });
 
     if (!route) return null;
-    return formatRouteResponse(route);
+    return formatRouteResponseWithWaypoints(route);
 }
 
 /**
@@ -89,7 +165,7 @@ async function getAllRoutes(userId = null) {
         where,
         include: {
             _count: {
-                select: { points: true }
+                select: { points: true, waypoints: true }
             }
         },
         orderBy: { createdAt: 'desc' }
@@ -100,6 +176,7 @@ async function getAllRoutes(userId = null) {
         name: r.name,
         sourceType: r.sourceType,
         totalPoints: r._count.points,
+        totalWaypoints: r._count.waypoints,
         config: r.config,
         createdAt: r.createdAt
     }));
@@ -130,11 +207,14 @@ async function updateRouteConfig(routeId, configData) {
             include: {
                 points: {
                     orderBy: { seq: 'asc' }
+                },
+                waypoints: {
+                    orderBy: { seq: 'asc' }
                 }
             }
         });
 
-        return formatRouteResponse(updated);
+        return formatRouteResponseWithWaypoints(updated);
     } catch (error) {
         if (error.code === 'P2025') return null;
         throw error;
@@ -142,7 +222,7 @@ async function updateRouteConfig(routeId, configData) {
 }
 
 /**
- * Delete route (cascade deletes points)
+ * Delete route (cascade deletes points and waypoints)
  * @param {string} routeId 
  * @returns {boolean}
  */
@@ -185,7 +265,8 @@ function formatRouteResponse(route) {
             lng: p.lng,
             speed: p.speed,
             bearing: p.bearing,
-            accuracy: p.accuracy
+            accuracy: p.accuracy,
+            dwellSeconds: p.dwellSeconds || 0
         })),
         config: route.config,
         createdAt: route.createdAt,
@@ -193,8 +274,32 @@ function formatRouteResponse(route) {
     };
 }
 
+/**
+ * Format route response including waypoints (when available)
+ * @param {Object} route 
+ * @returns {Object}
+ */
+function formatRouteResponseWithWaypoints(route) {
+    const base = formatRouteResponse(route);
+    if (route.waypoints && route.waypoints.length > 0) {
+        base.waypoints = route.waypoints.map(wp => ({
+            seq: wp.seq,
+            kind: wp.kind,
+            mode: wp.mode,
+            label: wp.label,
+            text: wp.text,
+            lat: wp.lat,
+            lng: wp.lng,
+            dwellSeconds: wp.dwellSeconds,
+            pointIndex: wp.pointIndex
+        }));
+    }
+    return base;
+}
+
 module.exports = {
     createRoute,
+    createRouteWithWaypoints,
     getRoute,
     getAllRoutes,
     updateRouteConfig,

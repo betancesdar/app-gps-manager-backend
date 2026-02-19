@@ -22,10 +22,21 @@ const server = http.createServer(app);
 // CRITICAL: Manual WebSocket upgrade handler
 // This prevents Express from intercepting /ws and returning 400
 server.on('upgrade', (req, socket, head) => {
-    console.log('🔥 WS UPGRADE HIT');
-    console.log('🔥 URL:', req.url);
-    console.log('🔥 HEADERS:', JSON.stringify({
-        authorization: req.headers['authorization'] ? 'Bearer ***' : undefined,
+    const rawUrl = req.url;
+
+    // Normalize URL: collapse double slashes (e.g. //ws -> /ws)
+    req.url = req.url.replace(/\/+/g, '/');
+
+    // Mask token in logs
+    const authHeader = req.headers['authorization'];
+    const maskedAuth = authHeader
+        ? 'Bearer ' + authHeader.replace('Bearer ', '').substring(0, 10) + '***'
+        : undefined;
+
+    console.log('🔥 WS UPGRADE raw url:', rawUrl);
+    console.log('🔥 WS UPGRADE normalized url:', req.url);
+    console.log('🔥 WS UPGRADE headers:', JSON.stringify({
+        authorization: maskedAuth,
         'x-device-id': req.headers['x-device-id']
     }));
 

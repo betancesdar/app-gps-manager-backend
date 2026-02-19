@@ -3,11 +3,15 @@
  * Manages coordinate streaming PER DEVICE
  * PostgreSQL for history, Redis for hot state
  * Map<deviceId, StreamInstance> for active intervals
+ *
+ * Dwell support: when a route point has dwellSeconds > 0,
+ * the stream pauses at that point (emitting speed=0, state=WAIT)
+ * for the specified duration before continuing.
  */
 
 const { prisma } = require('../lib/prisma');
-const redis = require('../lib/redis');
-const { calculateBearing } = require('../utils/gpx.parser');
+const { setStreamState, updateStreamState, deleteStreamState, getStreamState } = require('../lib/redis');
+const { calculateBearing } = require('../utils/geospatial.util');
 const deviceService = require('./device.service');
 const routeService = require('./route.service');
 const config = require('../config/config');
@@ -31,6 +35,13 @@ class StreamInstance {
         this.intervalId = null;
         this.startedAt = null;
         this.lastEmitAt = null;
+        this.dbId = null;
+
+        // Dwell state
+        // Number of ticks remaining in current WAIT phase
+        this.dwellTicksRemaining = 0;
+        // Current movement state: 'MOVE' | 'WAIT'
+        this.state = 'MOVE';
     }
 }
 
@@ -48,7 +59,7 @@ async function startStream(deviceId, routeId, options = {}) {
         throw new Error('Device not connected via WebSocket');
     }
 
-    // Get route from PostgreSQL
+    // Get route from PostgreSQL (includes waypoints)
     const route = await routeService.getRoute(routeId);
     if (!route) {
         throw new Error('Route not found');
@@ -85,7 +96,7 @@ async function startStream(deviceId, routeId, options = {}) {
     stream.dbId = dbStream.id;
 
     // Save hot state to Redis
-    await redis.setStreamState(deviceId, {
+    await setStreamState(deviceId, {
         streamId: dbStream.id,
         routeId,
         status: 'running',
@@ -116,7 +127,9 @@ async function startStream(deviceId, routeId, options = {}) {
 }
 
 /**
- * Emit the next coordinate to the device
+ * Emit the next coordinate to the device.
+ * Handles dwell: if the current point has dwellSeconds > 0, emits
+ * speed=0 / state=WAIT for that many ticks before advancing.
  * @param {string} deviceId 
  */
 async function emitNextCoordinate(deviceId) {
@@ -130,9 +143,21 @@ async function emitNextCoordinate(deviceId) {
     }
 
     const currentPoint = stream.points[stream.currentIndex];
-    const nextPoint = stream.points[stream.currentIndex + 1] || stream.points[0];
 
-    // Calculate bearing
+    // ── Dwell entry: first time we land on a point with dwellSeconds ──
+    if (stream.dwellTicksRemaining === 0 && currentPoint.dwellSeconds > 0 && stream.state === 'MOVE') {
+        const ticks = Math.ceil((currentPoint.dwellSeconds * 1000) / stream.config.intervalMs);
+        stream.dwellTicksRemaining = ticks;
+        stream.state = 'WAIT';
+        console.log(`[Stream] enter WAIT waypoint seq=${stream.currentIndex} dwell=${currentPoint.dwellSeconds}s (${ticks} ticks) device=${deviceId}`);
+    }
+
+    // ── Determine effective speed and state ───────────────────────────
+    const isWaiting = stream.state === 'WAIT' && stream.dwellTicksRemaining > 0;
+    const effectiveSpeed = isWaiting ? 0 : stream.config.speed;
+
+    // Calculate bearing (use next point for direction, or last bearing while waiting)
+    const nextPoint = stream.points[stream.currentIndex + 1] || stream.points[0];
     const bearing = calculateBearing(currentPoint, nextPoint);
 
     // Build MOCK_LOCATION message
@@ -141,9 +166,10 @@ async function emitNextCoordinate(deviceId) {
         payload: {
             lat: currentPoint.lat,
             lng: currentPoint.lng,
-            speed: stream.config.speed,
+            speed: effectiveSpeed,
             bearing: bearing,
-            accuracy: stream.config.accuracy
+            accuracy: stream.config.accuracy,
+            state: stream.state  // 'MOVE' | 'WAIT' — non-breaking addition
         },
         meta: {
             pointIndex: stream.currentIndex,
@@ -158,7 +184,7 @@ async function emitNextCoordinate(deviceId) {
         stream.lastEmitAt = new Date().toISOString();
 
         // Update Redis state
-        await redis.updateStreamState(deviceId, {
+        await updateStreamState(deviceId, {
             currentIndex: stream.currentIndex
         });
     } catch (error) {
@@ -167,13 +193,27 @@ async function emitNextCoordinate(deviceId) {
         return;
     }
 
-    // Move to next point
+    // ── Dwell tick countdown ──────────────────────────────────────────
+    if (isWaiting) {
+        stream.dwellTicksRemaining--;
+        if (stream.dwellTicksRemaining <= 0) {
+            stream.dwellTicksRemaining = 0;
+            stream.state = 'MOVE';
+            console.log(`[Stream] exit WAIT waypoint seq=${stream.currentIndex} device=${deviceId}`);
+        }
+        // Do NOT advance index while waiting
+        return;
+    }
+
+    // ── Advance to next point ─────────────────────────────────────────
     stream.currentIndex++;
 
     // Check if reached end
     if (stream.currentIndex >= stream.points.length) {
         if (stream.config.loop) {
             stream.currentIndex = 0;
+            stream.state = 'MOVE';
+            stream.dwellTicksRemaining = 0;
         } else {
             await stopStream(deviceId);
         }
@@ -205,7 +245,7 @@ async function pauseStream(deviceId) {
     }
 
     // Update Redis
-    await redis.updateStreamState(deviceId, { status: 'paused' });
+    await updateStreamState(deviceId, { status: 'paused' });
 
     return {
         deviceId,
@@ -235,7 +275,7 @@ async function resumeStream(deviceId) {
     }
 
     // Update Redis
-    await redis.updateStreamState(deviceId, { status: 'running' });
+    await updateStreamState(deviceId, { status: 'running' });
 
     stream.intervalId = setInterval(() => {
         emitNextCoordinate(deviceId);
@@ -277,7 +317,7 @@ async function stopStream(deviceId) {
     }
 
     // Delete Redis state
-    await redis.deleteStreamState(deviceId);
+    await deleteStreamState(deviceId);
 
     const result = {
         deviceId,
@@ -304,8 +344,10 @@ async function getStreamStatus(deviceId) {
             deviceId,
             routeId: stream.routeId,
             status: stream.status,
+            state: stream.state,
             currentIndex: stream.currentIndex,
             totalPoints: stream.points.length,
+            dwellTicksRemaining: stream.dwellTicksRemaining,
             config: stream.config,
             startedAt: stream.startedAt,
             lastEmitAt: stream.lastEmitAt
@@ -313,7 +355,7 @@ async function getStreamStatus(deviceId) {
     }
 
     // Check Redis for hot state
-    const redisState = await redis.getStreamState(deviceId);
+    const redisState = await getStreamState(deviceId);
     if (redisState) {
         return {
             deviceId,
@@ -339,6 +381,7 @@ function getAllStreams() {
             deviceId,
             routeId: stream.routeId,
             status: stream.status,
+            state: stream.state,
             currentIndex: stream.currentIndex,
             totalPoints: stream.points.length
         });

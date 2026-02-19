@@ -28,10 +28,10 @@ module.exports = {
 
     // Stream defaults
     STREAM_DEFAULTS: {
-        speed: 30,           // km/h
-        accuracy: 5,         // meters
-        intervalMs: 1000,    // emit every 1 second
-        loop: false
+        speed: parseFloat(process.env.STREAM_DEFAULT_SPEED) || 30,     // km/h
+        accuracy: parseFloat(process.env.STREAM_DEFAULT_ACCURACY) || 5, // meters
+        intervalMs: parseInt(process.env.STREAM_TICK_MS) || 1000,       // emit every N ms
+        loop: process.env.STREAM_DEFAULT_LOOP === 'true' || false
     },
 
     // OpenRouteService (ORS)

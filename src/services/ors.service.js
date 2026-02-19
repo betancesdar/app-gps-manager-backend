@@ -338,9 +338,121 @@ async function autocompleteAddress(query, limit = 6, country = null) {
     }
 }
 
+/**
+ * Get directions for multiple waypoints in a single ORS request
+ * @param {Array<{lat: number, lng: number}>} waypoints - Array of 2..N coordinates
+ * @param {string} profile - Routing profile
+ * @returns {Promise<{geometry: Array, distanceMeters: number, durationSeconds: number}>}
+ * @throws {Error} If directions request fails
+ */
+async function getDirectionsMulti(waypoints, profile = 'driving-car') {
+    if (!ORS_API_KEY) {
+        throw new Error('ORS_API_KEY is not configured');
+    }
+
+    if (!waypoints || waypoints.length < 2) {
+        throw new Error('At least 2 waypoints are required');
+    }
+
+    // Validate profile
+    const validProfiles = [
+        'driving-car', 'driving-hgv', 'cycling-regular',
+        'cycling-road', 'cycling-mountain', 'cycling-electric',
+        'foot-walking', 'foot-hiking', 'wheelchair'
+    ];
+
+    if (!validProfiles.includes(profile)) {
+        throw new Error(`Invalid profile: ${profile}. Must be one of: ${validProfiles.join(', ')}`);
+    }
+
+    // Build coordinates array in ORS format [lng, lat]
+    const coordinates = waypoints.map(wp => {
+        if (wp.lat == null || wp.lng == null) {
+            throw new Error('Each waypoint must have lat and lng');
+        }
+        return [parseFloat(wp.lng), parseFloat(wp.lat)];
+    });
+
+    try {
+        console.log(`[ORS] Getting multi-waypoint directions: ${waypoints.length} points (${profile})`);
+
+        const response = await axios.post(
+            `${ORS_BASE_URL}/v2/directions/${profile}/geojson`,
+            {
+                coordinates,
+                instructions: false,
+                elevation: false
+            },
+            {
+                headers: {
+                    'Authorization': ORS_API_KEY,
+                    'Content-Type': 'application/json'
+                },
+                timeout: 20000 // 20 second timeout for multi-waypoint
+            }
+        );
+
+        const features = response.data?.features;
+
+        if (!features || features.length === 0) {
+            throw new Error('No route found between the specified waypoints');
+        }
+
+        const route = features[0];
+        const geometry = route.geometry.coordinates; // Array of [lng, lat]
+
+        // Aggregate distance and duration from all segments
+        const segments = route.properties?.segments;
+        let distanceMeters = 0;
+        let durationSeconds = 0;
+
+        if (segments && segments.length > 0) {
+            segments.forEach(seg => {
+                distanceMeters += seg.distance || 0;
+                durationSeconds += seg.duration || 0;
+            });
+        } else if (route.properties?.summary) {
+            distanceMeters = route.properties.summary.distance;
+            durationSeconds = route.properties.summary.duration;
+        } else {
+            throw new Error('ORS response missing distance/duration information');
+        }
+
+        // Convert geometry from [lng, lat] to {lat, lng}
+        const points = geometry.map(coord => ({
+            lng: coord[0],
+            lat: coord[1]
+        }));
+
+        console.log(`[ORS] Multi-waypoint route: ${Math.round(distanceMeters)}m, ${Math.round(durationSeconds)}s, ${points.length} raw points`);
+
+        return {
+            geometry: points,
+            distanceMeters,
+            durationSeconds
+        };
+
+    } catch (error) {
+        if (error.response) {
+            const status = error.response.status;
+            const message = error.response.data?.error?.message || error.message;
+
+            if (status === 404) {
+                throw new Error('No route found between the specified locations');
+            }
+
+            throw new Error(`ORS API error (${status}): ${message}`);
+        }
+
+        // Network or timeout error
+        throw new Error(`ORS service unavailable: ${error.message}`);
+    }
+}
+
 module.exports = {
     geocodeAddress,
     getDirections,
+    getDirectionsMulti,
     clearGeocodeCache,
     autocompleteAddress
 };

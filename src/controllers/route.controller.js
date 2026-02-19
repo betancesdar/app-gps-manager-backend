@@ -616,13 +616,258 @@ async function deleteRoute(req, res) {
     }
 }
 
+/**
+ * POST /api/routes/from-waypoints
+ * Create route from waypoints array with optional dwellSeconds per stop.
+ * Supports mode=address (geocoded via ORS) and mode=manual (lat/lng provided).
+ * Backward compatible: does NOT replace from-addresses or from-addresses-with-stops.
+ */
+async function createFromWaypoints(req, res) {
+    try {
+        const {
+            name,
+            profile = 'driving-car',
+            pointSpacingMeters,
+            waypoints
+        } = req.body;
+
+        const userId = req.user?.userId;
+
+        if (!userId) {
+            return res.status(401).json({ success: false, error: 'User not authenticated' });
+        }
+
+        // ── Validate waypoints array ──────────────────────────────────────
+        if (!waypoints || !Array.isArray(waypoints) || waypoints.length < 2) {
+            return res.status(400).json({
+                success: false,
+                error: 'waypoints must be an array with at least 2 entries'
+            });
+        }
+
+        const VALID_KINDS = ['origin', 'stop', 'destination'];
+        const VALID_MODES = ['address', 'manual'];
+
+        for (let i = 0; i < waypoints.length; i++) {
+            const wp = waypoints[i];
+            if (!VALID_KINDS.includes(wp.kind)) {
+                return res.status(400).json({
+                    success: false,
+                    error: `waypoints[${i}].kind must be one of: ${VALID_KINDS.join(', ')}`
+                });
+            }
+            if (!VALID_MODES.includes(wp.mode)) {
+                return res.status(400).json({
+                    success: false,
+                    error: `waypoints[${i}].mode must be one of: ${VALID_MODES.join(', ')}`
+                });
+            }
+            if (wp.mode === 'address' && !wp.text) {
+                return res.status(400).json({
+                    success: false,
+                    error: `waypoints[${i}] has mode=address but is missing text`
+                });
+            }
+            if (wp.mode === 'manual' && (wp.lat == null || wp.lng == null)) {
+                return res.status(400).json({
+                    success: false,
+                    error: `waypoints[${i}] has mode=manual but is missing lat/lng`
+                });
+            }
+            if (wp.dwellSeconds !== undefined && (isNaN(Number(wp.dwellSeconds)) || Number(wp.dwellSeconds) < 0)) {
+                return res.status(400).json({
+                    success: false,
+                    error: `waypoints[${i}].dwellSeconds must be >= 0`
+                });
+            }
+        }
+
+        // Exactly 1 origin and 1 destination
+        const origins = waypoints.filter(wp => wp.kind === 'origin');
+        const destinations = waypoints.filter(wp => wp.kind === 'destination');
+        if (origins.length !== 1) {
+            return res.status(400).json({ success: false, error: 'Exactly 1 waypoint with kind=origin is required' });
+        }
+        if (destinations.length !== 1) {
+            return res.status(400).json({ success: false, error: 'Exactly 1 waypoint with kind=destination is required' });
+        }
+        if (waypoints[0].kind !== 'origin') {
+            return res.status(400).json({ success: false, error: 'First waypoint must have kind=origin' });
+        }
+        if (waypoints[waypoints.length - 1].kind !== 'destination') {
+            return res.status(400).json({ success: false, error: 'Last waypoint must have kind=destination' });
+        }
+
+        // Validate point spacing
+        const spacing = pointSpacingMeters || config.ORS_DEFAULT_POINT_SPACING;
+        if (spacing <= 0 || spacing > 1000) {
+            return res.status(400).json({
+                success: false,
+                error: 'pointSpacingMeters must be between 1 and 1000'
+            });
+        }
+
+        console.log(`[RouteController] Creating route from ${waypoints.length} waypoints`);
+
+        // ── Step 1: Resolve all waypoints to coordinates ─────────────────
+        const resolvedWaypoints = [];
+        for (let i = 0; i < waypoints.length; i++) {
+            const wp = waypoints[i];
+            let lat, lng;
+
+            if (wp.mode === 'manual') {
+                lat = parseFloat(wp.lat);
+                lng = parseFloat(wp.lng);
+                if (isNaN(lat) || isNaN(lng)) {
+                    return res.status(400).json({
+                        success: false,
+                        error: `waypoints[${i}] has invalid lat/lng values`
+                    });
+                }
+            } else {
+                // mode === 'address' — geocode via ORS
+                try {
+                    const coords = await orsService.geocodeAddress(wp.text);
+                    lat = coords.lat;
+                    lng = coords.lng;
+                } catch (geocodeError) {
+                    return res.status(400).json({
+                        success: false,
+                        error: `Geocoding failed for waypoints[${i}] ("${wp.text}"): ${geocodeError.message}. Tip: use mode=manual and provide lat/lng directly.`
+                    });
+                }
+            }
+
+            resolvedWaypoints.push({
+                ...wp,
+                lat,
+                lng,
+                dwellSeconds: parseInt(wp.dwellSeconds) || 0
+            });
+        }
+
+        // ── Step 2: Get directions for all waypoints in one ORS call ──────
+        let directionsResult;
+        try {
+            directionsResult = await orsService.getDirectionsMulti(resolvedWaypoints, profile);
+        } catch (directionsError) {
+            return res.status(502).json({
+                success: false,
+                error: `Directions service failed: ${directionsError.message}`
+            });
+        }
+
+        const { geometry, distanceMeters, durationSeconds } = directionsResult;
+        console.log(`[RouteController] Route: ${Math.round(distanceMeters)}m, ${Math.round(durationSeconds)}s, ${geometry.length} raw points`);
+
+        // ── Step 3: Resample geometry ─────────────────────────────────────
+        let resampledPoints;
+        try {
+            resampledPoints = resamplePoints(geometry, spacing);
+        } catch (resampleError) {
+            return res.status(500).json({
+                success: false,
+                error: `Point resampling failed: ${resampleError.message}`
+            });
+        }
+        console.log(`[RouteController] Resampled to ${resampledPoints.length} points at ${spacing}m spacing`);
+
+        // ── Step 4: Calculate bearing per point ───────────────────────────
+        const pointsWithMeta = resampledPoints.map((point, index) => {
+            const nextPoint = index < resampledPoints.length - 1 ? resampledPoints[index + 1] : null;
+            return {
+                lat: point.lat,
+                lng: point.lng,
+                bearing: nextPoint ? calculateBearing(point, nextPoint) : null,
+                speed: null,
+                accuracy: null,
+                dwellSeconds: 0 // will be set below for waypoint points
+            };
+        });
+
+        // ── Step 5: Map waypoints to nearest route point indices ──────────
+        // For each waypoint, find the closest point in the resampled array
+        // and mark it with dwellSeconds.
+        const { calculateDistance } = geospatialUtil;
+        const waypointsWithIndex = resolvedWaypoints.map((wp, wpIdx) => {
+            let bestIdx = 0;
+            let bestDist = Infinity;
+            for (let pi = 0; pi < pointsWithMeta.length; pi++) {
+                const d = calculateDistance(pointsWithMeta[pi], wp);
+                if (d < bestDist) {
+                    bestDist = d;
+                    bestIdx = pi;
+                }
+            }
+            // Mark the route point with dwell
+            if (wp.dwellSeconds > 0) {
+                pointsWithMeta[bestIdx].dwellSeconds = wp.dwellSeconds;
+            }
+            return { ...wp, pointIndex: bestIdx };
+        });
+
+        // ── Step 6: Persist route + waypoints ────────────────────────────
+        const routeName = name || `${resolvedWaypoints[0].label || 'Origin'} → ${resolvedWaypoints[resolvedWaypoints.length - 1].label || 'Destination'}`;
+
+        const route = await routeService.createRouteWithWaypoints(
+            {
+                name: routeName,
+                points: pointsWithMeta,
+                waypoints: waypointsWithIndex,
+                sourceType: 'ors_waypoints'
+            },
+            userId
+        );
+
+        // ── Step 7: Audit log ─────────────────────────────────────────────
+        await auditService.log(auditService.ACTIONS.ROUTE_CREATE, {
+            userId,
+            meta: {
+                routeId: route.routeId,
+                name: route.name,
+                pointCount: pointsWithMeta.length,
+                waypointCount: waypoints.length,
+                source: 'ors_waypoints',
+                profile,
+                distanceMeters: Math.round(distanceMeters),
+                durationSeconds: Math.round(durationSeconds)
+            }
+        });
+
+        console.log(`[RouteController] ✅ Route with waypoints created: ${route.routeId}`);
+
+        return res.status(201).json({
+            success: true,
+            message: 'Route with waypoints created',
+            data: {
+                routeId: route.routeId,
+                name: route.name,
+                distanceM: Math.round(distanceMeters),
+                durationS: Math.round(durationSeconds),
+                pointsCount: pointsWithMeta.length,
+                pointSpacingMeters: spacing,
+                waypoints: route.waypoints
+            }
+        });
+
+    } catch (error) {
+        console.error('[RouteController] Create route from waypoints error:', error);
+        return res.status(500).json({
+            success: false,
+            error: error.message || 'Failed to create route from waypoints'
+        });
+    }
+}
+
 module.exports = {
     createFromPoints,
     createFromGPX,
     createFromAddresses,
     createFromAddressesWithStops,
+    createFromWaypoints,
     getAllRoutes,
     getRoute,
     updateRouteConfig,
     deleteRoute
 };
+

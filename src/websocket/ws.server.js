@@ -1,7 +1,9 @@
 /**
  * WebSocket Server
  * Uses noServer: true + manual upgrade handling
- * Token and deviceId come from HEADERS
+ * Auth: headers (Android) OR query params (tooling/curl)
+ *   - Authorization: Bearer <token>  OR  ?token=<token>
+ *   - X-Device-Id: <id>              OR  ?deviceId=<id>
  * Validates against Redis + PostgreSQL
  */
 
@@ -21,6 +23,12 @@ const wss = new WebSocketServer({ noServer: true });
  */
 function broadcast(type, payload) {
     wss.clients.forEach(client => {
+        // Filter: Device events go only to admins (dashboards)
+        // Devices don't need to know about other devices connecting
+        if (type.startsWith('DEVICE_') && client.clientType !== 'admin') {
+            return;
+        }
+
         if (client.readyState === 1) { // OPEN
             client.send(JSON.stringify({
                 type,
@@ -33,14 +41,30 @@ function broadcast(type, payload) {
 
 // Handle WebSocket connections
 wss.on('connection', async (ws, req) => {
-    // Read token and deviceId from HEADERS
-    const token = req.headers['authorization']?.replace('Bearer ', '');
-    const deviceId = req.headers['x-device-id'];
-    const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    // ── Parse query params (for tooling fallback) ─────────────────────
+    const urlStr = req.url || '';
+    const qIdx = urlStr.indexOf('?');
+    const queryParams = qIdx >= 0
+        ? new URLSearchParams(urlStr.slice(qIdx + 1))
+        : new URLSearchParams();
 
-    console.log('🔐 WS CONNECT token:', token ? token.substring(0, 20) + '...' : 'missing');
-    console.log('📱 WS CONNECT deviceId:', deviceId);
-    console.log('🌐 WS CONNECT IP:', clientIp);
+    // Auth: prefer headers (Android), fall back to query params (tooling)
+    const rawAuthHeader = req.headers['authorization'];
+    const token = rawAuthHeader?.replace('Bearer ', '').trim()
+        || queryParams.get('token')
+        || null;
+
+    const deviceId = req.headers['x-device-id']
+        || queryParams.get('deviceId')
+        || null;
+
+    const clientIp = req.headers['x-forwarded-for'] || req.socket?.remoteAddress;
+
+    // Mask token in logs (show first 20 chars only)
+    const tokenPreview = token ? token.substring(0, 20) + '...' : 'missing';
+    console.log(`🔐 WS CONNECT token: ${tokenPreview}`);
+    console.log(`📱 WS CONNECT deviceId: ${deviceId || 'missing'}`);
+    console.log(`🌐 WS CONNECT IP: ${clientIp}`);
 
     // ═══════════════════════════════════════════════════════════════════
     // Validation 1: Check token exists
@@ -68,33 +92,61 @@ wss.on('connection', async (ws, req) => {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // Validation 3: Verify JWT is valid
+    // Validation 3: Check authorization (Hybrid: Redis -> JWT -> Device Token)
     // ═══════════════════════════════════════════════════════════════════
-    let decodedToken;
-    try {
-        decodedToken = verifyToken(token);
-    } catch (error) {
-        console.log('❌ WebSocket rejected: Invalid token -', error.message);
-        await auditService.log(auditService.ACTIONS.WS_AUTH_FAIL, {
-            deviceId,
-            meta: { reason: 'invalid_token', error: error.message, ip: clientIp }
-        });
-        ws.close(4002, 'invalid token');
-        return;
+
+    // 1. Check Redis Cache first (Fastest)
+    let isAuthorized = await deviceService.isDeviceAuthorizedForWS(deviceId, token);
+    let userId = null;
+    let clientType = 'unknown';
+
+    if (!isAuthorized) {
+        // Redis miss or expired. Validating credentials...
+
+        // 2. Try Legacy JWT (User/Admin Token)
+        try {
+            const decoded = verifyToken(token);
+            if (decoded.role !== 'device') {
+                userId = decoded.userId;
+                isAuthorized = true;
+                clientType = 'admin'; // Assume non-device tokens are admin/user
+                console.log(`✅ WS Auth: User JWT for ${deviceId} (User: ${userId})`);
+            } else {
+                // 3. Try Device JWT (New Flow)
+                // verifyToken already validated signature and expiration
+                if (decoded.deviceId === deviceId) {
+                    isAuthorized = true;
+                    clientType = 'device';
+                    console.log(`✅ WS Auth: Device JWT for ${deviceId}`);
+                }
+            }
+        } catch (jwtError) {
+            // Token invalid or expired
+            console.log(`❌ WS Auth Failed: ${jwtError.message}`);
+        }
+
+        // If authorized, cache in Redis
+        if (isAuthorized) {
+            await deviceService.authorizeDeviceForWS(deviceId, userId || 'device', token);
+        }
+    } else {
+        // Redis valid
+        const cachedAuth = await deviceService.getWsAuthorization(deviceId);
+        userId = cachedAuth?.userId;
+        // Infer client type from userId (if it's 'device', then device)
+        clientType = (userId === 'device') ? 'device' : 'admin';
     }
 
-    // ═══════════════════════════════════════════════════════════════════
-    // Validation 4: Check Redis authorization
-    // ═══════════════════════════════════════════════════════════════════
-    const isAuthorized = await deviceService.isDeviceAuthorizedForWS(deviceId, token);
+    // Attach client type to WS instance for broadcasting
+    ws.clientType = clientType;
+
     if (!isAuthorized) {
-        console.log(`❌ WebSocket rejected: Device ${deviceId} not authorized in Redis`);
+        console.log(`❌ WebSocket rejected: Not authorized`);
         await auditService.log(auditService.ACTIONS.WS_AUTH_FAIL, {
-            userId: decodedToken?.userId,
             deviceId,
-            meta: { reason: 'not_authorized_redis', ip: clientIp }
+            meta: { reason: 'auth_failed', ip: clientIp }
         });
-        ws.close(4004, 'device not registered');
+        ws.close(4001, 'auth failed');
         return;
     }
 
