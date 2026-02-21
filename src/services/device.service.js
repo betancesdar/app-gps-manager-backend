@@ -129,7 +129,7 @@ async function createEnrollment(adminUser, options = {}) {
         throw new Error('Rate limit exceeded for enrollment generation');
     }
 
-    // 2. Generate Code
+    // 2. Generate 6-digit Code
     let code;
     let attempts = 0;
     while (attempts < 3) {
@@ -150,7 +150,11 @@ async function createEnrollment(adminUser, options = {}) {
 
     // TTL: 10 minutes (default)
     const ttl = process.env.ENROLL_TTL_SECONDS || 600;
-    await redisClient.set(`enroll:${code}`, JSON.stringify(enrollData), 'EX', ttl);
+    const key = `enroll:${code}`;
+
+    await redisClient.set(key, JSON.stringify(enrollData), 'EX', ttl);
+
+    console.log(`[Enrollment] Created code=${code} ttl=${ttl}s for user=${adminUser.userId}`);
 
     return {
         enrollmentCode: code,
@@ -165,10 +169,17 @@ async function createEnrollment(adminUser, options = {}) {
  */
 async function confirmEnrollment(code, payload) {
     const redisClient = redis.getRedis();
-    const key = `enroll:${code}`;
+
+    // Normalize code: trim, remove spaces
+    const normalizedCode = (code || '').toString().replace(/\s+/g, '');
+    const key = `enroll:${normalizedCode}`;
 
     // 1. Validate Code
     const dataStr = await redisClient.get(key);
+    const ttl = await redisClient.ttl(key);
+
+    console.log(`[Enrollment] Attempt: code=${normalizedCode} redisKeyExists=${!!dataStr} ttl=${ttl}`);
+
     if (!dataStr) {
         throw new Error('Invalid or expired enrollment code');
     }
@@ -196,6 +207,7 @@ async function confirmEnrollment(code, payload) {
         },
         create: {
             deviceId,
+            user: { connect: { id: enrollData.createdBy } }, // Link to enrolling admin
             platform: payload.platform || 'android',
             appVersion: payload.appVersion || '1.0.0',
             label: enrollData.label || 'Enrolled Device',
@@ -212,6 +224,7 @@ async function confirmEnrollment(code, payload) {
 
     // 5. Cleanup Redis
     await redisClient.del(key);
+    console.log(`[Enrollment] Success: code=${normalizedCode} claimed by device=${deviceId}`);
 
     return {
         deviceId: device.deviceId,

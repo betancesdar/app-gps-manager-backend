@@ -1,0 +1,85 @@
+# Prometheus Alert Rules for GPS Mock Location Backend
+
+groups:
+  - name: gps_backend_alerts
+    interval: 30s
+    rules:
+      # WebSocket Connections
+      - alert: HighWebSocketConnections
+        expr: gps_websocket_connections_active > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High WebSocket connections ({{ $value }})"
+          description: "More than 1000 WebSocket connections active"
+
+      # Database Errors
+      - alert: DatabaseConnectionFailure
+        expr: increase(gps_errors_total{type="database"}[5m]) > 10
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Database connection failures"
+          description: "Multiple database connection errors in last 5 minutes"
+
+      # Authentication Failures
+      - alert: HighAuthenticationFailures
+        expr: rate(gps_auth_attempts_total{result="failed"}[5m]) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High authentication failure rate"
+          description: "Authentication failure rate > 10% over last 5 minutes"
+
+      # HTTP Errors
+      - alert: HighHTTPErrorRate
+        expr: rate(gps_http_request_duration_seconds_count{status=~"5.."}[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High HTTP error rate"
+          description: "HTTP 5xx error rate > 5% over last 5 minutes"
+
+      # Slow Database Queries
+      - alert: SlowDatabaseQueries
+        expr: histogram_quantile(0.95, gps_db_query_duration_seconds_bucket) > 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Slow database queries detected"
+          description: "95th percentile query duration > 1 second"
+
+      # Memory Usage
+      - alert: HighMemoryUsage
+        expr: node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes < 0.2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High memory usage"
+          description: "Less than 20% free memory available"
+
+      # GPX Parse Errors
+      - alert: HighGPXParseErrors
+        expr: increase(gps_gpx_parse_errors_total[5m]) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Multiple GPX parsing errors"
+          description: "{{ $value }} GPX parsing errors in last 5 minutes"
+
+      # Cache Hit Rate Too Low
+      - alert: LowCacheHitRate
+        expr: (gps_cache_hits_total / (gps_cache_hits_total + gps_cache_misses_total)) < 0.3
+        for: 10m
+        labels:
+          severity: info
+        annotations:
+          summary: "Low cache hit rate"
+          description: "Cache hit rate below 30%"

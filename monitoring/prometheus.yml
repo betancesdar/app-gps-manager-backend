@@ -1,0 +1,29 @@
+# Prometheus Configuration for GPS Mock Location Backend
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: 'gps-mock-backend'
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: []
+
+rule_files:
+  - '/etc/prometheus/alert_rules.yml'
+
+scrape_configs:
+  # GPS Backend API Metrics
+  - job_name: 'gps-api'
+    static_configs:
+      - targets: ['api:4000']
+    metrics_path: '/metrics'
+    scrape_interval: 15s
+    scrape_timeout: 10s
+
+  # Prometheus itself metrics
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
