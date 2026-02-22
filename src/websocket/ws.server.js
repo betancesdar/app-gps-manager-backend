@@ -157,7 +157,7 @@ wss.on('connection', async (ws, req) => {
     if (!deviceExists) {
         console.log(`❌ WebSocket rejected: Device ${deviceId} not found in database`);
         await auditService.log(auditService.ACTIONS.WS_AUTH_FAIL, {
-            userId: decodedToken?.userId,
+            userId: userId,
             deviceId,
             meta: { reason: 'not_in_database', ip: clientIp }
         });
@@ -176,7 +176,7 @@ wss.on('connection', async (ws, req) => {
 
         // Audit log
         await auditService.log(auditService.ACTIONS.WS_CONNECT, {
-            userId: decodedToken?.userId,
+            userId: userId,
             deviceId,
             meta: { ip: clientIp }
         });
@@ -246,7 +246,7 @@ wss.on('connection', async (ws, req) => {
         try {
             await deviceService.removeDeviceConnection(deviceId);
             await auditService.log(auditService.ACTIONS.WS_DISCONNECT, {
-                userId: decodedToken?.userId,
+                userId: userId,
                 deviceId,
                 meta: { code, reason: reason?.toString() }
             });

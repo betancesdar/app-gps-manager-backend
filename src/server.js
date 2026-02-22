@@ -74,6 +74,24 @@ async function startServer() {
         console.log('\n🔴 Connecting to Redis...');
         await connectRedis();
 
+        // ── Clean up orphaned stream:* keys from previous run ──────────────
+        // If the server was killed mid-stream, Redis still holds stale state
+        // that the new in-memory StreamMap doesn't know about.
+        try {
+            const { getRedis } = require('./lib/redis');
+            const redisClient = getRedis();
+            const keys = await redisClient.keys('stream:*');
+            if (keys.length > 0) {
+                await redisClient.del(...keys);
+                console.log(`🧹 Cleaned ${keys.length} orphaned stream key(s) from previous run`);
+            } else {
+                console.log('✅ No orphaned stream keys found');
+            }
+        } catch (cleanupErr) {
+            // Non-fatal — server still starts
+            console.warn('⚠️  Could not clean stream keys:', cleanupErr.message);
+        }
+
         // Start HTTP server
         const PORT = config.PORT;
         server.listen(PORT, '0.0.0.0', () => {

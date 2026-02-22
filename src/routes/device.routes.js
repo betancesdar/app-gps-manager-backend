@@ -2,9 +2,17 @@ const express = require('express');
 const router = express.Router();
 const deviceController = require('../controllers/device.controller');
 const authMiddleware = require('../middleware/auth.middleware');
+const { createIpRateLimit } = require('../middleware/rateLimit.middleware');
 
-// Public routes (for device activation)
-router.post('/activate', deviceController.activate);
+// Rate limit: 30 activate attempts per minute per IP
+const activateRateLimit = createIpRateLimit(
+    30,   // max requests
+    60,   // window seconds
+    'ratelimit:activate:'
+);
+
+// Public routes (for device activation — rate limited by IP)
+router.post('/activate', activateRateLimit, deviceController.activate);
 
 // Protected routes (JWT required)
 router.use(authMiddleware);

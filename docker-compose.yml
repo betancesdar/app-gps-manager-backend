@@ -60,7 +60,7 @@ services:
       - PORT=4000
       - DATABASE_URL=postgresql://gps_user:gps_password@postgres:5432/gps_mock_db
       - REDIS_URL=redis://redis:6379
-      - JWT_SECRET=${JWT_SECRET:-super_secret_jwt_key_change_in_production}
+      - JWT_SECRET=${JWT_SECRET}
       - DEFAULT_ADMIN_PASSWORD=${DEFAULT_ADMIN_PASSWORD:-admin123}
       - ORS_API_KEY=${ORS_API_KEY:-eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6IjVjYTdhOGU4OTFiNzRiZDE5ZTIxNTc0ODE1Yjc4NmM3IiwiaCI6Im11cm11cjY0In0=}
       - ORS_API_URL=${ORS_API_URL:-https://api.openrouteservice.org}
