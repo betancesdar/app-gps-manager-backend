@@ -99,6 +99,8 @@ wss.on('connection', async (ws, req) => {
     let isAuthorized = await deviceService.isDeviceAuthorizedForWS(deviceId, token);
     let userId = null;
     let clientType = 'unknown';
+    // FIX: declare decodedToken in outer scope so all subsequent code can reference it
+    let decodedToken = null;
 
     if (!isAuthorized) {
         // Redis miss or expired. Validating credentials...
@@ -106,6 +108,7 @@ wss.on('connection', async (ws, req) => {
         // 2. Try Legacy JWT (User/Admin Token)
         try {
             const decoded = verifyToken(token);
+            decodedToken = decoded; // ← assign to outer-scope variable
             if (decoded.role !== 'device') {
                 userId = decoded.userId;
                 isAuthorized = true;
@@ -130,7 +133,7 @@ wss.on('connection', async (ws, req) => {
             await deviceService.authorizeDeviceForWS(deviceId, userId || 'device', token);
         }
     } else {
-        // Redis valid
+        // Redis valid — restore userId and clientType from cache
         const cachedAuth = await deviceService.getWsAuthorization(deviceId);
         userId = cachedAuth?.userId;
         // Infer client type from userId (if it's 'device', then device)
@@ -157,7 +160,7 @@ wss.on('connection', async (ws, req) => {
     if (!deviceExists) {
         console.log(`❌ WebSocket rejected: Device ${deviceId} not found in database`);
         await auditService.log(auditService.ACTIONS.WS_AUTH_FAIL, {
-            userId: decodedToken?.userId,
+            userId,  // FIX: use `userId` (always in scope) instead of decodedToken?.userId
             deviceId,
             meta: { reason: 'not_in_database', ip: clientIp }
         });
@@ -167,31 +170,40 @@ wss.on('connection', async (ws, req) => {
 
     // ═══════════════════════════════════════════════════════════════════
     // SUCCESS: Associate WebSocket connection with device
+    // FIX: connection store errors are NON-FATAL — log but keep socket open
     // ═══════════════════════════════════════════════════════════════════
     try {
         await deviceService.setDeviceConnection(deviceId, ws);
-
         // Update device with last IP
         await deviceService.updateDevice(deviceId, { lastIp: clientIp });
+        console.log(`✅ Device ${deviceId} connection stored`);
+    } catch (connError) {
+        // Non-fatal: log the warning but do NOT close the socket.
+        // The device is authenticated and the WS is valid — let it stay connected.
+        console.error(`⚠️ [WS] Failed to persist connection state for ${deviceId} (non-fatal):`, connError.message);
+    }
 
-        // Audit log
+    // Audit log (also non-fatal)
+    try {
         await auditService.log(auditService.ACTIONS.WS_CONNECT, {
-            userId: decodedToken?.userId,
+            userId,  // FIX: use `userId` (always in scope)
             deviceId,
             meta: { ip: clientIp }
         });
-
-        console.log(`✅ Device ${deviceId} connected via WebSocket`);
-
-        // Broadcast to dashboards
-        broadcast('DEVICE_CONNECTED', { deviceId, ip: clientIp });
-    } catch (error) {
-        console.error(`❌ Failed to set device connection:`, error.message);
-        ws.close(4500, 'internal error');
-        return;
+    } catch (auditErr) {
+        console.warn(`⚠️ [WS] Audit log failed (non-fatal):`, auditErr.message);
     }
 
-    // Send welcome message
+    // Broadcast to dashboards (non-fatal)
+    try {
+        broadcast('DEVICE_CONNECTED', { deviceId, ip: clientIp });
+    } catch (broadcastErr) {
+        console.warn(`⚠️ [WS] Broadcast failed (non-fatal):`, broadcastErr.message);
+    }
+
+    console.log(`✅ Device ${deviceId} connected via WebSocket (clientType: ${clientType})`);
+
+    // Send CONNECTED frame to Android — always, regardless of internal errors above
     ws.send(JSON.stringify({
         type: 'CONNECTED',
         payload: {
@@ -246,7 +258,7 @@ wss.on('connection', async (ws, req) => {
         try {
             await deviceService.removeDeviceConnection(deviceId);
             await auditService.log(auditService.ACTIONS.WS_DISCONNECT, {
-                userId: decodedToken?.userId,
+                userId,  // FIX: use `userId` (always in scope)
                 deviceId,
                 meta: { code, reason: reason?.toString() }
             });

@@ -31,11 +31,11 @@ COPY --from=deps /app/node_modules ./node_modules
 # Copy source code and prisma schema
 COPY . .
 
-# Generate Prisma client
+# Generate Prisma client with current schema
+# NOTE: We do NOT prune devDependencies here because `prisma` CLI is a
+# devDependency needed at container startup to re-run `npx prisma generate`
+# against the volume-mounted schema (see docker-compose CMD).
 RUN npx prisma generate
-
-# Remove dev dependencies for smaller image
-RUN npm prune --production
 
 # ═══════════════════════════════════════════════════════════════════
 # Stage 3: Runner (production image)

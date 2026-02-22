@@ -25,8 +25,10 @@ const server = http.createServer(app);
 server.on('upgrade', (req, socket, head) => {
   const rawUrl = req.url;
 
-  // Normalize URL: collapse double slashes (e.g. //ws -> /ws)
-  req.url = req.url.replace(/\/+/g, '/');
+  // Normalize URL:
+  //   1. Collapse double slashes (e.g. //ws -> /ws)
+  //   2. Strip trailing slash (e.g. /ws/ -> /ws)
+  req.url = req.url.replace(/\/+/g, '/').replace(/\/$/, '') || '/';
 
   // Mask token in logs
   const authHeader = req.headers.authorization;
@@ -40,9 +42,10 @@ server.on('upgrade', (req, socket, head) => {
     auth: maskedAuth ? '****' : 'missing',
   });
 
-  // Only handle /ws path
-  if (!req.url.startsWith('/ws')) {
-    logger.warn('Non-WebSocket upgrade request rejected', { path: req.url });
+  // Accept ONLY /ws — reject everything else with a proper HTTP response
+  if (req.url !== '/ws') {
+    logger.warn('Non-WebSocket upgrade rejected', { path: req.url, raw: rawUrl });
+    socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
     socket.destroy();
     return;
   }
