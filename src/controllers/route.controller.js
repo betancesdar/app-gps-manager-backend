@@ -486,19 +486,29 @@ async function createFromAddressesWithStops(req, res) {
 /**
  * GET /api/routes
  * Get all routes
+ * Supports ?page=1&limit=20
  */
 async function getAllRoutes(req, res) {
     try {
         const userId = req.user?.userId;
+        const page = Math.max(1, parseInt(req.query.page) || 1);
+        const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
+
         // If admin, show all routes; otherwise filter by user
         const filterUserId = req.user?.role === 'admin' ? null : userId;
 
         const routes = await routeService.getAllRoutes(filterUserId);
 
+        const total = routes.length;
+        const totalPages = Math.ceil(total / limit);
+        const offset = (page - 1) * limit;
+        const paged = routes.slice(offset, offset + limit);
+
         return res.status(200).json({
             success: true,
-            data: routes,
-            count: routes.length
+            data: paged,
+            pagination: { page, limit, total, totalPages, hasMore: page < totalPages },
+            count: paged.length
         });
     } catch (error) {
         console.error('Get routes error:', error);

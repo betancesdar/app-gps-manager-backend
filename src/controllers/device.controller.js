@@ -66,12 +66,15 @@ async function registerDevice(req, res) {
 /**
  * GET /api/devices
  * Get all devices (Admin)
- * Supports ?activeWithinSeconds=600
- * Sorts: Connected > Disconnected
+ * Supports ?activeWithinSeconds=600&page=1&limit=20
+ * Sorts: Connected > Disconnected, then by lastSeenAt desc
  */
 async function getAllDevices(req, res) {
     try {
         const { activeWithinSeconds } = req.query;
+        const page = Math.max(1, parseInt(req.query.page) || 1);
+        const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
+
         let devices = await deviceService.getAllDevices();
 
         // Filter
@@ -88,19 +91,25 @@ async function getAllDevices(req, res) {
             return a.isConnected ? -1 : 1;
         });
 
+        const total = devices.length;
+        const totalPages = Math.ceil(total / limit);
+        const offset = (page - 1) * limit;
+        const paged = devices.slice(offset, offset + limit);
+
         return res.status(200).json({
             success: true,
-            data: devices.map(d => ({
+            data: paged.map(d => ({
                 deviceId: d.deviceId,
+                label: d.label,
                 platform: d.platform,
                 appVersion: d.appVersion,
                 registeredAt: d.registeredAt,
                 lastSeenAt: d.lastSeenAt,
                 isConnected: d.isConnected,
-                user: d.user?.username,
-                label: d.label // Include label
+                user: d.user?.username
             })),
-            count: devices.length
+            pagination: { page, limit, total, totalPages, hasMore: page < totalPages },
+            count: paged.length
         });
     } catch (error) {
         console.error('Get devices error:', error);
