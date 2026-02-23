@@ -4,6 +4,7 @@
  */
 
 const { v4: uuidv4 } = require('uuid');
+const bcrypt = require('bcrypt');
 const { prisma } = require('../lib/prisma');
 const redis = require('../lib/redis'); // Exports getRedis(), etc.
 const { generateToken, verifyToken } = require('../utils/jwt.util');
@@ -144,7 +145,8 @@ async function createEnrollment(adminUser, options = {}) {
     const enrollData = {
         label,
         requestedDeviceId,
-        createdBy: adminUser.userId,
+        userId: adminUser.userId,
+        createdBy: adminUser.userId, // kept for backward compatibility if any active enrollments use it
         createdAt: new Date().toISOString()
     };
 
@@ -185,7 +187,24 @@ async function confirmEnrollment(code, payload) {
         deviceId = `android-${uuidv4().split('-')[0]}-${Math.floor(Date.now() / 1000)}`;
     }
 
-    // 3. Upsert Device in DB
+    // 3. Determine ownerUserId (fallback to admin if not in enrollment)
+    let ownerUserId = enrollData.userId || enrollData.createdBy;
+
+    if (!ownerUserId) {
+        const passwordHash = await bcrypt.hash(config.DEFAULT_ADMIN_PASSWORD || 'admin123', 10);
+        const admin = await prisma.user.upsert({
+            where: { username: 'admin' },
+            update: {},
+            create: {
+                username: 'admin',
+                role: 'ADMIN',
+                passwordHash
+            }
+        });
+        ownerUserId = admin.id;
+    }
+
+    // 4. Upsert Device in DB
     const device = await prisma.device.upsert({
         where: { deviceId },
         update: {
@@ -199,18 +218,19 @@ async function confirmEnrollment(code, payload) {
             platform: payload.platform || 'android',
             appVersion: payload.appVersion || '1.0.0',
             label: enrollData.label || 'Enrolled Device',
-            lastSeenAt: new Date()
+            lastSeenAt: new Date(),
+            user: { connect: { id: ownerUserId } }
         }
     });
 
-    // 4. Generate JWT
+    // 5. Generate JWT
     const token = generateToken({
         role: 'device',
         deviceId: device.deviceId,
         sub: device.deviceId
     });
 
-    // 5. Cleanup Redis
+    // 6. Cleanup Redis
     await redisClient.del(key);
 
     return {
