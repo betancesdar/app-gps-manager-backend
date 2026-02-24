@@ -403,97 +403,197 @@ async function emitNextCoordinate(deviceId) {
 }
 
 async function pauseStream(deviceId) {
-    const stream = activeStreams.get(deviceId);
-    if (!stream) return null;
+    try {
+        const stream = activeStreams.get(deviceId);
+        if (!stream) {
+            return {
+                deviceId,
+                status: 'not_running',
+                currentIndex: 0,
+                totalPoints: 0
+            };
+        }
 
-    if (stream.intervalId) {
+        if (stream.status === 'paused') {
+            return {
+                deviceId,
+                status: 'paused',
+                currentIndex: stream.engineMode === 'distance' ? stream.segIndex : stream.currentIndex,
+                totalPoints: stream.points.length
+            };
+        }
+
+        if (stream.intervalId) {
+            clearInterval(stream.intervalId);
+            stream.intervalId = null;
+        }
+
+        stream.status = 'paused';
+
+        if (stream.dbId) {
+            try {
+                await prisma.stream.update({
+                    where: { id: stream.dbId },
+                    data: { status: 'PAUSED' }
+                });
+            } catch (err) {
+                console.error(`[Stream] DB error on pause for ${deviceId}`, err.message);
+            }
+        }
+
+        try {
+            await updateStreamState(deviceId, { status: 'paused' });
+        } catch (err) {
+            console.error(`[Stream] Redis error on pause for ${deviceId}`, err.message);
+        }
+
+        return {
+            deviceId,
+            status: stream.status,
+            currentIndex: stream.engineMode === 'distance' ? stream.segIndex : stream.currentIndex,
+            totalPoints: stream.points.length
+        };
+    } catch (criticalError) {
+        console.error(`[Stream] Critical error pausing stream for ${deviceId}:`, criticalError.stack);
+        return { deviceId, status: 'error', error: 'Failed to pause' };
+    }
+}
+
+async function resumeStream(deviceId) {
+    try {
+        const stream = activeStreams.get(deviceId);
+        if (!stream) return null;
+
+        if (stream.status === 'running') {
+            return {
+                deviceId,
+                status: 'running',
+                currentIndex: stream.engineMode === 'distance' ? stream.segIndex : stream.currentIndex,
+                totalPoints: stream.points.length
+            };
+        }
+
+        stream.status = 'running';
+
+        if (stream.dbId) {
+            try {
+                await prisma.stream.update({
+                    where: { id: stream.dbId },
+                    data: { status: 'STARTED' }
+                });
+            } catch (err) {
+                console.error(`[Stream] DB error on resume for ${deviceId}`, err.message);
+            }
+        }
+
+        try {
+            await updateStreamState(deviceId, { status: 'running' });
+        } catch (err) {
+            console.error(`[Stream] Redis error on resume for ${deviceId}`, err.message);
+        }
+
+        // Reset lastTickTs when resuming distance engine
+        if (stream.engineMode === 'distance') {
+            stream.lastTickTs = Date.now();
+        }
+
+        if (stream.intervalId) {
+            clearInterval(stream.intervalId);
+        }
+
+        stream.intervalId = setInterval(() => {
+            emitNextCoordinate(deviceId);
+        }, stream.config.intervalMs);
+
+        emitNextCoordinate(deviceId);
+
+        return {
+            deviceId,
+            status: stream.status,
+            currentIndex: stream.engineMode === 'distance' ? stream.segIndex : stream.currentIndex,
+            totalPoints: stream.points.length
+        };
+    } catch (criticalError) {
+        console.error(`[Stream] Critical error resuming stream for ${deviceId}:`, criticalError.stack);
+        return null;
+    }
+}
+
+async function stopStream(deviceId) {
+    try {
+        const stream = activeStreams.get(deviceId);
+        const statusBefore = stream ? stream.status : 'not_running';
+
+        let finalIndex = 0;
+        let totalPoints = 0;
+        let dbId = null;
+
+        if (stream) {
+            finalIndex = stream.engineMode === 'distance' ? stream.segIndex : stream.currentIndex;
+            totalPoints = stream.points ? stream.points.length : 0;
+            dbId = stream.dbId;
+        }
+
+        await cleanupStream(deviceId, `User requested stop`);
+
+        if (dbId) {
+            try {
+                await prisma.stream.update({
+                    where: { id: dbId },
+                    data: {
+                        status: 'STOPPED',
+                        stoppedAt: new Date()
+                    }
+                });
+            } catch (err) {
+                console.error(`[Stream] DB error on stop for ${deviceId}`, err.message);
+            }
+        }
+
+        const data = {
+            deviceId,
+            status: 'stopped',
+            finalIndex,
+            totalPoints
+        };
+
+        // Output structured log as requested
+        console.log(JSON.stringify({
+            event: 'STREAM_STOP',
+            deviceId,
+            statusBefore,
+            statusAfter: 'stopped',
+            reason: 'manual_stop'
+        }));
+
+        return data;
+    } catch (criticalError) {
+        console.error(`[Stream] Critical error stopping stream for ${deviceId}:`, criticalError.stack);
+        // Best effort cleanup even on complete failure
+        await cleanupStream(deviceId, 'crash_recovery');
+        return { deviceId, status: 'stopped', error: 'Stopped with errors' };
+    }
+}
+
+/**
+ * Cleanup helper to safely clear memory timers and Redis streams
+ */
+async function cleanupStream(deviceId, reason) {
+    console.log(`[Stream] Cleanup triggered for device=${deviceId}, reason="${reason}"`);
+
+    const stream = activeStreams.get(deviceId);
+    if (stream && stream.intervalId) {
         clearInterval(stream.intervalId);
         stream.intervalId = null;
     }
 
-    stream.status = 'paused';
-
-    if (stream.dbId) {
-        await prisma.stream.update({
-            where: { id: stream.dbId },
-            data: { status: 'PAUSED' }
-        });
-    }
-
-    await updateStreamState(deviceId, { status: 'paused' });
-
-    return {
-        deviceId,
-        status: stream.status,
-        currentIndex: stream.engineMode === 'distance' ? stream.segIndex : stream.currentIndex,
-        totalPoints: stream.points.length
-    };
-}
-
-async function resumeStream(deviceId) {
-    const stream = activeStreams.get(deviceId);
-    if (!stream || stream.status !== 'paused') return null;
-
-    stream.status = 'running';
-
-    if (stream.dbId) {
-        await prisma.stream.update({
-            where: { id: stream.dbId },
-            data: { status: 'STARTED' }
-        });
-    }
-
-    await updateStreamState(deviceId, { status: 'running' });
-
-    // Reset lastTickTs when resuming distance engine
-    if (stream.engineMode === 'distance') {
-        stream.lastTickTs = Date.now();
-    }
-
-    stream.intervalId = setInterval(() => {
-        emitNextCoordinate(deviceId);
-    }, stream.config.intervalMs);
-
-    emitNextCoordinate(deviceId);
-
-    return {
-        deviceId,
-        status: stream.status,
-        currentIndex: stream.engineMode === 'distance' ? stream.segIndex : stream.currentIndex,
-        totalPoints: stream.points.length
-    };
-}
-
-async function stopStream(deviceId) {
-    const stream = activeStreams.get(deviceId);
-    if (!stream) return null;
-
-    if (stream.intervalId) {
-        clearInterval(stream.intervalId);
-    }
-
-    if (stream.dbId) {
-        await prisma.stream.update({
-            where: { id: stream.dbId },
-            data: {
-                status: 'STOPPED',
-                stoppedAt: new Date()
-            }
-        });
-    }
-
-    await deleteStreamState(deviceId);
-
-    const result = {
-        deviceId,
-        status: 'stopped',
-        finalIndex: stream.engineMode === 'distance' ? stream.segIndex : stream.currentIndex,
-        totalPoints: stream.points.length
-    };
-
     activeStreams.delete(deviceId);
 
-    return result;
+    try {
+        await deleteStreamState(deviceId);
+    } catch (err) {
+        console.error(`[Stream] Failed to delete redis state for device=${deviceId}:`, err.message);
+    }
 }
 
 async function getStreamStatus(deviceId) {

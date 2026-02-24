@@ -80,10 +80,25 @@ wss.on('connection', async (ws, req) => {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // Validation 2: Check deviceId exists
+    // Validation 1.5: Decode token to check if Admin/User (bypass deviceId)
     // ═══════════════════════════════════════════════════════════════════
-    if (!deviceId) {
-        console.log('❌ WebSocket rejected: No deviceId provided');
+    let isGlobalAdminOrUser = false;
+    let decodedToken = null;
+    let jwtErrorMsg = null;
+    try {
+        decodedToken = verifyToken(token);
+        if (decodedToken && decodedToken.role !== 'device') {
+            isGlobalAdminOrUser = true;
+        }
+    } catch (e) {
+        jwtErrorMsg = e.message;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════
+    // Validation 2: Check deviceId exists (if not admin)
+    // ═══════════════════════════════════════════════════════════════════
+    if (!deviceId && !isGlobalAdminOrUser) {
+        console.log('❌ WebSocket rejected: No deviceId provided for device connection');
         await auditService.log(auditService.ACTIONS.WS_AUTH_FAIL, {
             meta: { reason: 'no_device_id', ip: clientIp }
         });
@@ -95,38 +110,32 @@ wss.on('connection', async (ws, req) => {
     // Validation 3: Check authorization (Hybrid: Redis -> JWT -> Device Token)
     // ═══════════════════════════════════════════════════════════════════
 
-    // 1. Check Redis Cache first (Fastest)
-    let isAuthorized = await deviceService.isDeviceAuthorizedForWS(deviceId, token);
+    // 1. Check Redis Cache first (Fastest) - ONLY if deviceId is present
+    let isAuthorized = false;
+    if (deviceId) {
+        isAuthorized = await deviceService.isDeviceAuthorizedForWS(deviceId, token);
+    }
+
     let userId = null;
     let clientType = 'unknown';
 
     if (!isAuthorized) {
-        // Redis miss or expired. Validating credentials...
-
-        // 2. Try Legacy JWT (User/Admin Token)
-        try {
-            const decoded = verifyToken(token);
-            if (decoded.role !== 'device') {
-                userId = decoded.userId;
-                isAuthorized = true;
-                clientType = 'admin'; // Assume non-device tokens are admin/user
-                console.log(`✅ WS Auth: User JWT for ${deviceId} (User: ${userId})`);
-            } else {
-                // 3. Try Device JWT (New Flow)
-                // verifyToken already validated signature and expiration
-                if (decoded.deviceId === deviceId) {
-                    isAuthorized = true;
-                    clientType = 'device';
-                    console.log(`✅ WS Auth: Device JWT for ${deviceId}`);
-                }
-            }
-        } catch (jwtError) {
-            // Token invalid or expired
-            console.log(`❌ WS Auth Failed: ${jwtError.message}`);
+        // Redis miss or expired (or no deviceId). Validating credentials...
+        if (jwtErrorMsg) {
+            console.log(`❌ WS Auth Failed: ${jwtErrorMsg}`);
+        } else if (isGlobalAdminOrUser) {
+            userId = decodedToken.userId;
+            isAuthorized = true;
+            clientType = 'admin';
+            console.log(`✅ WS Auth: User JWT for Global Connection (User: ${userId})`);
+        } else if (decodedToken && decodedToken.deviceId === deviceId) {
+            isAuthorized = true;
+            clientType = 'device';
+            console.log(`✅ WS Auth: Device JWT for ${deviceId}`);
         }
 
-        // If authorized, cache in Redis
-        if (isAuthorized) {
+        // If authorized AND we have a deviceId, cache in Redis
+        if (isAuthorized && deviceId) {
             await deviceService.authorizeDeviceForWS(deviceId, userId || 'device', token);
         }
     } else {
