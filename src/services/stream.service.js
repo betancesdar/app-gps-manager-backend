@@ -145,248 +145,259 @@ async function startStream(deviceId, routeId, options = {}) {
  * Emit the next coordinate
  */
 async function emitNextCoordinate(deviceId) {
-    const stream = activeStreams.get(deviceId);
-    if (!stream || stream.status !== 'running') return;
+    try {
+        const stream = activeStreams.get(deviceId);
+        if (!stream || stream.status !== 'running') return;
 
-    const ws = deviceService.getDeviceConnection(deviceId);
-    if (!ws || ws.readyState !== 1) {
-        await pauseStream(deviceId);
-        return;
-    }
+        const ws = deviceService.getDeviceConnection(deviceId);
+        if (!ws || ws.readyState !== 1) {
+            await pauseStream(deviceId).catch(e => console.error('Error auto-pausing closed ws:', e));
+            return;
+        }
 
-    if (stream.engineMode === 'distance') {
-        const now = Date.now();
-        const dtMs = Math.min(
-            config.STREAM_TICK_CLAMP_MAX_MS,
-            Math.max(config.STREAM_TICK_CLAMP_MIN_MS, now - stream.lastTickTs)
-        );
-        const dt = dtMs / 1000;
-        stream.lastTickTs = now;
+        if (stream.engineMode === 'distance') {
+            const now = Date.now();
+            const dtMs = Math.min(
+                config.STREAM_TICK_CLAMP_MAX_MS,
+                Math.max(config.STREAM_TICK_CLAMP_MIN_MS, now - stream.lastTickTs)
+            );
+            const dt = dtMs / 1000;
+            stream.lastTickTs = now;
 
-        const currentPoint = stream.points[stream.segIndex];
+            const currentPoint = stream.points[stream.segIndex];
 
-        let isWaiting = false;
-        if (currentPoint.dwellSeconds > 0) {
-            if (stream.dwellTicksRemaining === 0 && stream.state === 'MOVE') {
-                stream.vTargetMps = 0;
-                stream.state = 'WAIT';
-                const ticks = Math.ceil((currentPoint.dwellSeconds * 1000) / stream.config.intervalMs);
-                stream.dwellTicksRemaining = ticks;
-                console.log(`[Stream] enter WAIT device=${deviceId} ticks=${ticks}`);
-            }
+            let isWaiting = false;
+            if (currentPoint.dwellSeconds > 0) {
+                if (stream.dwellTicksRemaining === 0 && stream.state === 'MOVE') {
+                    stream.vTargetMps = 0;
+                    stream.state = 'WAIT';
+                    const ticks = Math.ceil((currentPoint.dwellSeconds * 1000) / stream.config.intervalMs);
+                    stream.dwellTicksRemaining = ticks;
+                    console.log(`[Stream] enter WAIT device=${deviceId} ticks=${ticks}`);
+                }
 
-            if (stream.state === 'WAIT') {
-                isWaiting = true;
-                if (stream.vMps <= 0.1) {
-                    stream.vMps = 0;
-                    stream.dwellTicksRemaining--;
-                    if (stream.dwellTicksRemaining <= 0) {
-                        stream.dwellTicksRemaining = 0;
-                        stream.state = 'MOVE';
-                        // restore target velocity
-                        stream.vTargetMps = stream.config.speed / 3.6;
-                        console.log(`[Stream] exit WAIT device=${deviceId}`);
+                if (stream.state === 'WAIT') {
+                    isWaiting = true;
+                    if (stream.vMps <= 0.1) {
+                        stream.vMps = 0;
+                        stream.dwellTicksRemaining--;
+                        if (stream.dwellTicksRemaining <= 0) {
+                            stream.dwellTicksRemaining = 0;
+                            stream.state = 'MOVE';
+                            // restore target velocity
+                            stream.vTargetMps = stream.config.speed / 3.6;
+                            console.log(`[Stream] exit WAIT device=${deviceId}`);
+                        }
                     }
                 }
             }
-        }
 
-        // Velocity Physics
-        if (stream.vMps < stream.vTargetMps) {
-            stream.vMps += ENGINE_CONSTANTS.aMax * dt;
-            if (stream.vMps > stream.vTargetMps) stream.vMps = stream.vTargetMps;
-        } else if (stream.vMps > stream.vTargetMps) {
-            stream.vMps -= ENGINE_CONSTANTS.bMax * dt;
-            if (stream.vMps < stream.vTargetMps) stream.vMps = stream.vTargetMps;
-        }
-        if (stream.vMps < 0) stream.vMps = 0;
+            // Velocity Physics
+            if (stream.vMps < stream.vTargetMps) {
+                stream.vMps += ENGINE_CONSTANTS.aMax * dt;
+                if (stream.vMps > stream.vTargetMps) stream.vMps = stream.vTargetMps;
+            } else if (stream.vMps > stream.vTargetMps) {
+                stream.vMps -= ENGINE_CONSTANTS.bMax * dt;
+                if (stream.vMps < stream.vTargetMps) stream.vMps = stream.vTargetMps;
+            }
+            if (stream.vMps < 0) stream.vMps = 0;
 
-        // Dynamic clamp
-        const maxMetersPerTick = Math.min(80, Math.max(15, stream.vTargetMps * dt * 2.5));
-        let metersToAdvance = stream.vMps * dt;
-        metersToAdvance = Math.min(metersToAdvance, maxMetersPerTick);
+            // Dynamic clamp
+            const maxMetersPerTick = Math.min(80, Math.max(15, stream.vTargetMps * dt * 2.5));
+            let metersToAdvance = stream.vMps * dt;
+            metersToAdvance = Math.min(metersToAdvance, maxMetersPerTick);
 
-        // Segment Traversal
-        stream.sMeters += metersToAdvance;
-        stream.segProgress += metersToAdvance;
+            // Segment Traversal
+            stream.sMeters += metersToAdvance;
+            stream.segProgress += metersToAdvance;
 
-        while (stream.segIndex < stream.points.length - 1) {
+            while (stream.segIndex < stream.points.length - 1) {
+                const p1 = stream.points[stream.segIndex];
+                const p2 = stream.points[stream.segIndex + 1];
+                const segDist = calculateDistance(p1, p2);
+
+                if (stream.segProgress >= segDist && segDist > 0) {
+                    stream.segIndex++;
+                    stream.segProgress -= segDist;
+                } else {
+                    break;
+                }
+            }
+
             const p1 = stream.points[stream.segIndex];
-            const p2 = stream.points[stream.segIndex + 1];
+            const p2 = stream.points[stream.segIndex + 1] || p1;
             const segDist = calculateDistance(p1, p2);
 
-            if (stream.segProgress >= segDist && segDist > 0) {
-                stream.segIndex++;
-                stream.segProgress -= segDist;
-            } else {
-                break;
+            const fraction = segDist > 0 ? stream.segProgress / segDist : 0;
+            const { lat, lng } = interpolatePoint(p1, p2, Math.min(1, fraction));
+
+            // Bearing & LookAhead Smoothing
+            let futureDist = stream.segProgress + ENGINE_CONSTANTS.lookAheadMeters;
+            let futureIndex = stream.segIndex;
+            while (futureIndex < stream.points.length - 1) {
+                const fd = calculateDistance(stream.points[futureIndex], stream.points[futureIndex + 1]);
+                if (futureDist > fd) {
+                    futureDist -= fd;
+                    futureIndex++;
+                } else {
+                    break;
+                }
             }
-        }
+            const futurePoint = stream.points[futureIndex + 1] || stream.points[futureIndex] || p2;
+            const rawTargetBearing = calculateBearing({ lat, lng }, futurePoint);
 
-        const p1 = stream.points[stream.segIndex];
-        const p2 = stream.points[stream.segIndex + 1] || p1;
-        const segDist = calculateDistance(p1, p2);
-
-        const fraction = segDist > 0 ? stream.segProgress / segDist : 0;
-        const { lat, lng } = interpolatePoint(p1, p2, Math.min(1, fraction));
-
-        // Bearing & LookAhead Smoothing
-        let futureDist = stream.segProgress + ENGINE_CONSTANTS.lookAheadMeters;
-        let futureIndex = stream.segIndex;
-        while (futureIndex < stream.points.length - 1) {
-            const fd = calculateDistance(stream.points[futureIndex], stream.points[futureIndex + 1]);
-            if (futureDist > fd) {
-                futureDist -= fd;
-                futureIndex++;
-            } else {
-                break;
+            if (stream.vMps > 0.5) {
+                let diff = rawTargetBearing - stream.headingDeg;
+                diff = ((diff + 540) % 360) - 180;
+                stream.headingDeg = (stream.headingDeg + diff * 0.3 + 360) % 360;
+            } else if (stream.segIndex === 0 && stream.segProgress === 0) {
+                stream.headingDeg = rawTargetBearing;
             }
-        }
-        const futurePoint = stream.points[futureIndex + 1] || stream.points[futureIndex] || p2;
-        const rawTargetBearing = calculateBearing({ lat, lng }, futurePoint);
 
-        if (stream.vMps > 0.5) {
-            let diff = rawTargetBearing - stream.headingDeg;
-            diff = ((diff + 540) % 360) - 180;
-            stream.headingDeg = (stream.headingDeg + diff * 0.3 + 360) % 360;
-        } else if (stream.segIndex === 0 && stream.segProgress === 0) {
-            stream.headingDeg = rawTargetBearing;
-        }
+            // Anti-Teleport
+            if (stream.lastEmittedLatLng) {
+                const jumpDist = calculateDistance(stream.lastEmittedLatLng, { lat, lng });
+                if (jumpDist > ENGINE_CONSTANTS.MAX_JUMP_METERS) {
+                    console.error(`[Stream] Anti-teleport triggered for ${deviceId}: Jump of ${Math.round(jumpDist)}m`);
+                    pauseStream(deviceId);
 
-        // Anti-Teleport
-        if (stream.lastEmittedLatLng) {
-            const jumpDist = calculateDistance(stream.lastEmittedLatLng, { lat, lng });
-            if (jumpDist > ENGINE_CONSTANTS.MAX_JUMP_METERS) {
-                console.error(`[Stream] Anti-teleport triggered for ${deviceId}: Jump of ${Math.round(jumpDist)}m`);
-                pauseStream(deviceId);
+                    console.error(JSON.stringify({
+                        error: "ANTI_TELEPORT_JUMP",
+                        deviceId,
+                        jumpMeters: jumpDist,
+                        dtMs,
+                        vMps: stream.vMps,
+                        segIndex: stream.segIndex
+                    }));
+                    return;
+                }
+            }
 
-                console.error(JSON.stringify({
-                    error: "ANTI_TELEPORT_JUMP",
-                    deviceId,
-                    jumpMeters: jumpDist,
+            stream.lastEmittedLatLng = { lat, lng };
+
+            const message = {
+                type: 'MOCK_LOCATION',
+                payload: {
+                    lat,
+                    lng,
+                    speed: stream.vMps * 3.6,
+                    bearing: stream.headingDeg,
+                    accuracy: stream.config.accuracy,
+                    state: stream.state
+                },
+                meta: {
+                    engineMode: 'distance',
                     dtMs,
-                    vMps: stream.vMps,
-                    segIndex: stream.segIndex
-                }));
+                    sMeters: Math.round(stream.sMeters),
+                    vMps: parseFloat(stream.vMps.toFixed(2)),
+                    segIndex: stream.segIndex,
+                    pointIndex: stream.segIndex,
+                    totalPoints: stream.points.length,
+                    routeId: stream.routeId,
+                    timestamp: new Date().toISOString()
+                }
+            };
+
+            try {
+                ws.send(JSON.stringify(message));
+                stream.lastEmitAt = new Date().toISOString();
+
+                await updateStreamState(deviceId, {
+                    currentIndex: stream.segIndex
+                });
+            } catch (error) {
+                await pauseStream(deviceId).catch(e => console.error('Error auto-pausing on ws error:', e));
                 return;
             }
-        }
 
-        stream.lastEmittedLatLng = { lat, lng };
-
-        const message = {
-            type: 'MOCK_LOCATION',
-            payload: {
-                lat,
-                lng,
-                speed: stream.vMps * 3.6,
-                bearing: stream.headingDeg,
-                accuracy: stream.config.accuracy,
-                state: stream.state
-            },
-            meta: {
-                engineMode: 'distance',
-                dtMs,
-                sMeters: Math.round(stream.sMeters),
-                vMps: parseFloat(stream.vMps.toFixed(2)),
-                segIndex: stream.segIndex,
-                pointIndex: stream.segIndex,
-                totalPoints: stream.points.length,
-                routeId: stream.routeId,
-                timestamp: new Date().toISOString()
+            if (stream.segIndex >= stream.points.length - 1 && stream.segProgress >= segDist - 0.5) {
+                if (stream.config.loop) {
+                    stream.sMeters = 0;
+                    stream.segIndex = 0;
+                    stream.segProgress = 0;
+                    stream.state = 'MOVE';
+                    stream.lastEmittedLatLng = null;
+                } else {
+                    await stopStream(deviceId).catch(e => console.error('Error auto-stopping:', e));
+                }
             }
-        };
+        } else {
+            // --- OLD INDEX-BASED ENGINE ---
+            const currentPoint = stream.points[stream.currentIndex];
 
-        try {
-            ws.send(JSON.stringify(message));
-            stream.lastEmitAt = new Date().toISOString();
+            if (stream.dwellTicksRemaining === 0 && currentPoint.dwellSeconds > 0 && stream.state === 'MOVE') {
+                const ticks = Math.ceil((currentPoint.dwellSeconds * 1000) / stream.config.intervalMs);
+                stream.dwellTicksRemaining = ticks;
+                stream.state = 'WAIT';
+            }
 
-            await updateStreamState(deviceId, {
-                currentIndex: stream.segIndex
-            });
-        } catch (error) {
-            await pauseStream(deviceId);
-            return;
-        }
+            const isWaiting = stream.state === 'WAIT' && stream.dwellTicksRemaining > 0;
+            const effectiveSpeed = isWaiting ? 0 : stream.config.speed;
 
-        if (stream.segIndex >= stream.points.length - 1 && stream.segProgress >= segDist - 0.5) {
-            if (stream.config.loop) {
-                stream.sMeters = 0;
-                stream.segIndex = 0;
-                stream.segProgress = 0;
-                stream.state = 'MOVE';
-                stream.lastEmittedLatLng = null;
-            } else {
-                await stopStream(deviceId);
+            const nextPoint = stream.points[stream.currentIndex + 1] || stream.points[0];
+            const bearing = calculateBearing(currentPoint, nextPoint);
+
+            const message = {
+                type: 'MOCK_LOCATION',
+                payload: {
+                    lat: currentPoint.lat,
+                    lng: currentPoint.lng,
+                    speed: effectiveSpeed,
+                    bearing: bearing,
+                    accuracy: stream.config.accuracy,
+                    state: stream.state
+                },
+                meta: {
+                    engineMode: 'index',
+                    pointIndex: stream.currentIndex,
+                    totalPoints: stream.points.length,
+                    routeId: stream.routeId,
+                    timestamp: new Date().toISOString()
+                }
+            };
+
+            try {
+                ws.send(JSON.stringify(message));
+                stream.lastEmitAt = new Date().toISOString();
+
+                await updateStreamState(deviceId, {
+                    currentIndex: stream.currentIndex
+                });
+            } catch (error) {
+                console.error(`Failed to send to device ${deviceId}:`, error.message);
+                await pauseStream(deviceId).catch(e => console.error('Error auto-pausing index:', e));
+                return;
+            }
+
+            if (isWaiting) {
+                stream.dwellTicksRemaining--;
+                if (stream.dwellTicksRemaining <= 0) {
+                    stream.dwellTicksRemaining = 0;
+                    stream.state = 'MOVE';
+                }
+                return;
+            }
+
+            stream.currentIndex++;
+
+            if (stream.currentIndex >= stream.points.length) {
+                if (stream.config.loop) {
+                    stream.currentIndex = 0;
+                    stream.state = 'MOVE';
+                    stream.dwellTicksRemaining = 0;
+                } else {
+                    await stopStream(deviceId).catch(e => console.error('Error auto-stopping index:', e));
+                }
             }
         }
-    } else {
-        // --- OLD INDEX-BASED ENGINE ---
-        const currentPoint = stream.points[stream.currentIndex];
-
-        if (stream.dwellTicksRemaining === 0 && currentPoint.dwellSeconds > 0 && stream.state === 'MOVE') {
-            const ticks = Math.ceil((currentPoint.dwellSeconds * 1000) / stream.config.intervalMs);
-            stream.dwellTicksRemaining = ticks;
-            stream.state = 'WAIT';
-        }
-
-        const isWaiting = stream.state === 'WAIT' && stream.dwellTicksRemaining > 0;
-        const effectiveSpeed = isWaiting ? 0 : stream.config.speed;
-
-        const nextPoint = stream.points[stream.currentIndex + 1] || stream.points[0];
-        const bearing = calculateBearing(currentPoint, nextPoint);
-
-        const message = {
-            type: 'MOCK_LOCATION',
-            payload: {
-                lat: currentPoint.lat,
-                lng: currentPoint.lng,
-                speed: effectiveSpeed,
-                bearing: bearing,
-                accuracy: stream.config.accuracy,
-                state: stream.state
-            },
-            meta: {
-                engineMode: 'index',
-                pointIndex: stream.currentIndex,
-                totalPoints: stream.points.length,
-                routeId: stream.routeId,
-                timestamp: new Date().toISOString()
-            }
-        };
-
-        try {
-            ws.send(JSON.stringify(message));
-            stream.lastEmitAt = new Date().toISOString();
-
-            await updateStreamState(deviceId, {
-                currentIndex: stream.currentIndex
-            });
-        } catch (error) {
-            console.error(`Failed to send to device ${deviceId}:`, error.message);
-            await pauseStream(deviceId);
-            return;
-        }
-
-        if (isWaiting) {
-            stream.dwellTicksRemaining--;
-            if (stream.dwellTicksRemaining <= 0) {
-                stream.dwellTicksRemaining = 0;
-                stream.state = 'MOVE';
-            }
-            return;
-        }
-
-        stream.currentIndex++;
-
-        if (stream.currentIndex >= stream.points.length) {
-            if (stream.config.loop) {
-                stream.currentIndex = 0;
-                stream.state = 'MOVE';
-                stream.dwellTicksRemaining = 0;
-            } else {
-                await stopStream(deviceId);
-            }
+    } catch (criticalError) {
+        console.error(`[CRITICAL] Error inside emitNextCoordinate for device ${deviceId}:`, criticalError);
+        // Clean interval immediately to prevent infinitely repeating crash loop
+        const stream = activeStreams.get(deviceId);
+        if (stream && stream.intervalId) {
+            clearInterval(stream.intervalId);
+            stream.intervalId = null;
+            stream.status = 'paused';
         }
     }
 }
