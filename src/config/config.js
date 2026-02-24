@@ -41,11 +41,23 @@ module.exports = {
     WS_AUTH_TTL: parseInt(process.env.WS_AUTH_TTL) || 900,      // 15 minutes
     WS_CONN_TTL: parseInt(process.env.WS_CONN_TTL) || 120,      // 2 minutes
 
+    // Route Safety Gate Constraints
+    ROUTE_SAFETY_GATE: process.env.ROUTE_SAFETY_GATE === 'true',
+    ROUTE_SIMPLIFY_METERS: Math.max(0, parseFloat(process.env.ROUTE_SIMPLIFY_METERS) || 2),
+    ROUTE_RESAMPLE_METERS: Math.max(1, parseFloat(process.env.ROUTE_RESAMPLE_METERS) || 5),
+    ROUTE_MAX_SEGMENT_METERS: Math.max(10, parseFloat(process.env.ROUTE_MAX_SEGMENT_METERS) || 200),
+    ROUTE_MIN_TOTAL_METERS: Math.max(0, parseFloat(process.env.ROUTE_MIN_TOTAL_METERS) || 50),
+
+    // Advanced Distance Simulator Engine
+    STREAM_DISTANCE_ENGINE: process.env.STREAM_DISTANCE_ENGINE === 'true',
+    STREAM_TICK_CLAMP_MIN_MS: Math.max(50, parseInt(process.env.STREAM_TICK_CLAMP_MIN_MS) || 200),
+    STREAM_TICK_CLAMP_MAX_MS: Math.max(500, parseInt(process.env.STREAM_TICK_CLAMP_MAX_MS) || 2000),
+
     // Stream defaults
     STREAM_DEFAULTS: {
         speed: parseFloat(process.env.STREAM_DEFAULT_SPEED) || 30,     // km/h
         accuracy: parseFloat(process.env.STREAM_DEFAULT_ACCURACY) || 5, // meters
-        intervalMs: parseInt(process.env.STREAM_TICK_MS) || 1000,       // emit every N ms
+        intervalMs: parseInt(process.env.STREAM_TICK_MS) || (process.env.STREAM_DISTANCE_ENGINE === 'true' ? 500 : 1000), // Default 500ms IF distance engine enabled
         loop: process.env.STREAM_DEFAULT_LOOP === 'true' || false
     },
 

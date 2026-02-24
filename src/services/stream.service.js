@@ -11,7 +11,7 @@
 
 const { prisma } = require('../lib/prisma');
 const { setStreamState, updateStreamState, deleteStreamState, getStreamState } = require('../lib/redis');
-const { calculateBearing } = require('../utils/geospatial.util');
+const { calculateBearing, calculateDistance, interpolatePoint } = require('../utils/geospatial.util');
 const deviceService = require('./device.service');
 const routeService = require('./route.service');
 const config = require('../config/config');
@@ -19,6 +19,14 @@ const config = require('../config/config');
 // Active streams per device (intervals, not serializable)
 // Map<deviceId, StreamInstance>
 const activeStreams = new Map();
+
+const ENGINE_CONSTANTS = {
+    aMax: 1.5, // m/s² (acceleration)
+    bMax: 2.5, // m/s² (deceleration)
+    lookAheadMeters: 15, // for angular smoothing target
+    MAX_METERS_PER_TICK: 50, // Physical clamp
+    MAX_JUMP_METERS: 100 // Anti-teleport
+};
 
 /**
  * StreamInstance class
@@ -30,7 +38,7 @@ class StreamInstance {
         this.routeId = routeId;
         this.points = points;
         this.config = { ...streamConfig };
-        this.currentIndex = 0;
+        this.currentIndex = 0; // Legacy
         this.status = 'idle';
         this.intervalId = null;
         this.startedAt = null;
@@ -38,52 +46,51 @@ class StreamInstance {
         this.dbId = null;
 
         // Dwell state
-        // Number of ticks remaining in current WAIT phase
         this.dwellTicksRemaining = 0;
-        // Current movement state: 'MOVE' | 'WAIT'
         this.state = 'MOVE';
+
+        // Distance engine physics state
+        this.sMeters = 0;
+        this.vMps = 0;
+        this.vTargetMps = (this.config.speed || 30) / 3.6;
+        this.segIndex = 0;
+        this.segProgress = 0;
+        this.headingDeg = 0;
+        this.lastTickTs = Date.now();
+        this.lastEmittedLatLng = null;
+        this.engineMode = config.STREAM_DISTANCE_ENGINE ? 'distance' : 'index';
     }
 }
 
 /**
  * Start streaming coordinates to a device
- * @param {string} deviceId 
- * @param {string} routeId 
- * @param {Object} options - Override config options
- * @returns {Object} Stream info
  */
 async function startStream(deviceId, routeId, options = {}) {
-    // Validate device is connected
     const ws = deviceService.getDeviceConnection(deviceId);
     if (!ws) {
         throw new Error('Device not connected via WebSocket');
     }
 
-    // Get route from PostgreSQL (includes waypoints)
     const route = await routeService.getRoute(routeId);
     if (!route) {
         throw new Error('Route not found');
     }
 
-    // Stop any existing stream for this device
     if (activeStreams.has(deviceId)) {
         await stopStream(deviceId);
     }
 
-    // Create stream config
     const streamConfig = {
-        speed: options.speed || route.config?.speed || config.STREAM_DEFAULTS.speed,
-        accuracy: options.accuracy || route.config?.accuracy || config.STREAM_DEFAULTS.accuracy,
-        intervalMs: options.intervalMs || route.config?.intervalMs || config.STREAM_DEFAULTS.intervalMs,
+        speed: parseFloat(options.speed || route.config?.speed || config.STREAM_DEFAULTS.speed),
+        accuracy: parseFloat(options.accuracy || route.config?.accuracy || config.STREAM_DEFAULTS.accuracy),
+        intervalMs: parseInt(options.intervalMs || route.config?.intervalMs || config.STREAM_DEFAULTS.intervalMs),
         loop: options.loop !== undefined ? options.loop : (route.config?.loop || config.STREAM_DEFAULTS.loop)
     };
 
-    // Create stream instance
     const stream = new StreamInstance(deviceId, routeId, route.points, streamConfig);
     stream.status = 'running';
     stream.startedAt = new Date().toISOString();
 
-    // Save to PostgreSQL
     const dbStream = await prisma.stream.create({
         data: {
             deviceId,
@@ -95,7 +102,6 @@ async function startStream(deviceId, routeId, options = {}) {
     });
     stream.dbId = dbStream.id;
 
-    // Save hot state to Redis
     await setStreamState(deviceId, {
         streamId: dbStream.id,
         routeId,
@@ -105,6 +111,15 @@ async function startStream(deviceId, routeId, options = {}) {
         speed: streamConfig.speed,
         loop: streamConfig.loop
     });
+
+    console.log(`[Stream] STREAM_STARTED 🚀 device=${deviceId} engineMode=${stream.engineMode}`);
+    console.log(JSON.stringify({
+        event: 'STREAM_STARTED',
+        deviceId,
+        speedConfigured: streamConfig.speed,
+        speedApplied: stream.vTargetMps * 3.6,
+        engineMode: stream.engineMode
+    }));
 
     // Start emitting coordinates
     stream.intervalId = setInterval(() => {
@@ -127,10 +142,7 @@ async function startStream(deviceId, routeId, options = {}) {
 }
 
 /**
- * Emit the next coordinate to the device.
- * Handles dwell: if the current point has dwellSeconds > 0, emits
- * speed=0 / state=WAIT for that many ticks before advancing.
- * @param {string} deviceId 
+ * Emit the next coordinate
  */
 async function emitNextCoordinate(deviceId) {
     const stream = activeStreams.get(deviceId);
@@ -142,89 +154,243 @@ async function emitNextCoordinate(deviceId) {
         return;
     }
 
-    const currentPoint = stream.points[stream.currentIndex];
+    if (stream.engineMode === 'distance') {
+        const now = Date.now();
+        const dtMs = Math.min(
+            config.STREAM_TICK_CLAMP_MAX_MS,
+            Math.max(config.STREAM_TICK_CLAMP_MIN_MS, now - stream.lastTickTs)
+        );
+        const dt = dtMs / 1000;
+        stream.lastTickTs = now;
 
-    // ── Dwell entry: first time we land on a point with dwellSeconds ──
-    if (stream.dwellTicksRemaining === 0 && currentPoint.dwellSeconds > 0 && stream.state === 'MOVE') {
-        const ticks = Math.ceil((currentPoint.dwellSeconds * 1000) / stream.config.intervalMs);
-        stream.dwellTicksRemaining = ticks;
-        stream.state = 'WAIT';
-        console.log(`[Stream] enter WAIT waypoint seq=${stream.currentIndex} dwell=${currentPoint.dwellSeconds}s (${ticks} ticks) device=${deviceId}`);
-    }
+        const currentPoint = stream.points[stream.segIndex];
 
-    // ── Determine effective speed and state ───────────────────────────
-    const isWaiting = stream.state === 'WAIT' && stream.dwellTicksRemaining > 0;
-    const effectiveSpeed = isWaiting ? 0 : stream.config.speed;
+        let isWaiting = false;
+        if (currentPoint.dwellSeconds > 0) {
+            if (stream.dwellTicksRemaining === 0 && stream.state === 'MOVE') {
+                stream.vTargetMps = 0;
+                stream.state = 'WAIT';
+                const ticks = Math.ceil((currentPoint.dwellSeconds * 1000) / stream.config.intervalMs);
+                stream.dwellTicksRemaining = ticks;
+                console.log(`[Stream] enter WAIT device=${deviceId} ticks=${ticks}`);
+            }
 
-    // Calculate bearing (use next point for direction, or last bearing while waiting)
-    const nextPoint = stream.points[stream.currentIndex + 1] || stream.points[0];
-    const bearing = calculateBearing(currentPoint, nextPoint);
-
-    // Build MOCK_LOCATION message
-    const message = {
-        type: 'MOCK_LOCATION',
-        payload: {
-            lat: currentPoint.lat,
-            lng: currentPoint.lng,
-            speed: effectiveSpeed,
-            bearing: bearing,
-            accuracy: stream.config.accuracy,
-            state: stream.state  // 'MOVE' | 'WAIT' — non-breaking addition
-        },
-        meta: {
-            pointIndex: stream.currentIndex,
-            totalPoints: stream.points.length,
-            routeId: stream.routeId,
-            timestamp: new Date().toISOString()
+            if (stream.state === 'WAIT') {
+                isWaiting = true;
+                if (stream.vMps <= 0.1) {
+                    stream.vMps = 0;
+                    stream.dwellTicksRemaining--;
+                    if (stream.dwellTicksRemaining <= 0) {
+                        stream.dwellTicksRemaining = 0;
+                        stream.state = 'MOVE';
+                        // restore target velocity
+                        stream.vTargetMps = stream.config.speed / 3.6;
+                        console.log(`[Stream] exit WAIT device=${deviceId}`);
+                    }
+                }
+            }
         }
-    };
 
-    try {
-        ws.send(JSON.stringify(message));
-        stream.lastEmitAt = new Date().toISOString();
-
-        // Update Redis state
-        await updateStreamState(deviceId, {
-            currentIndex: stream.currentIndex
-        });
-    } catch (error) {
-        console.error(`Failed to send to device ${deviceId}:`, error.message);
-        await pauseStream(deviceId);
-        return;
-    }
-
-    // ── Dwell tick countdown ──────────────────────────────────────────
-    if (isWaiting) {
-        stream.dwellTicksRemaining--;
-        if (stream.dwellTicksRemaining <= 0) {
-            stream.dwellTicksRemaining = 0;
-            stream.state = 'MOVE';
-            console.log(`[Stream] exit WAIT waypoint seq=${stream.currentIndex} device=${deviceId}`);
+        // Velocity Physics
+        if (stream.vMps < stream.vTargetMps) {
+            stream.vMps += ENGINE_CONSTANTS.aMax * dt;
+            if (stream.vMps > stream.vTargetMps) stream.vMps = stream.vTargetMps;
+        } else if (stream.vMps > stream.vTargetMps) {
+            stream.vMps -= ENGINE_CONSTANTS.bMax * dt;
+            if (stream.vMps < stream.vTargetMps) stream.vMps = stream.vTargetMps;
         }
-        // Do NOT advance index while waiting
-        return;
-    }
+        if (stream.vMps < 0) stream.vMps = 0;
 
-    // ── Advance to next point ─────────────────────────────────────────
-    stream.currentIndex++;
+        // Dynamic clamp
+        const maxMetersPerTick = Math.min(80, Math.max(15, stream.vTargetMps * dt * 2.5));
+        let metersToAdvance = stream.vMps * dt;
+        metersToAdvance = Math.min(metersToAdvance, maxMetersPerTick);
 
-    // Check if reached end
-    if (stream.currentIndex >= stream.points.length) {
-        if (stream.config.loop) {
-            stream.currentIndex = 0;
-            stream.state = 'MOVE';
-            stream.dwellTicksRemaining = 0;
-        } else {
-            await stopStream(deviceId);
+        // Segment Traversal
+        stream.sMeters += metersToAdvance;
+        stream.segProgress += metersToAdvance;
+
+        while (stream.segIndex < stream.points.length - 1) {
+            const p1 = stream.points[stream.segIndex];
+            const p2 = stream.points[stream.segIndex + 1];
+            const segDist = calculateDistance(p1, p2);
+
+            if (stream.segProgress >= segDist && segDist > 0) {
+                stream.segIndex++;
+                stream.segProgress -= segDist;
+            } else {
+                break;
+            }
+        }
+
+        const p1 = stream.points[stream.segIndex];
+        const p2 = stream.points[stream.segIndex + 1] || p1;
+        const segDist = calculateDistance(p1, p2);
+
+        const fraction = segDist > 0 ? stream.segProgress / segDist : 0;
+        const { lat, lng } = interpolatePoint(p1, p2, Math.min(1, fraction));
+
+        // Bearing & LookAhead Smoothing
+        let futureDist = stream.segProgress + ENGINE_CONSTANTS.lookAheadMeters;
+        let futureIndex = stream.segIndex;
+        while (futureIndex < stream.points.length - 1) {
+            const fd = calculateDistance(stream.points[futureIndex], stream.points[futureIndex + 1]);
+            if (futureDist > fd) {
+                futureDist -= fd;
+                futureIndex++;
+            } else {
+                break;
+            }
+        }
+        const futurePoint = stream.points[futureIndex + 1] || stream.points[futureIndex] || p2;
+        const rawTargetBearing = calculateBearing({ lat, lng }, futurePoint);
+
+        if (stream.vMps > 0.5) {
+            let diff = rawTargetBearing - stream.headingDeg;
+            diff = ((diff + 540) % 360) - 180;
+            stream.headingDeg = (stream.headingDeg + diff * 0.3 + 360) % 360;
+        } else if (stream.segIndex === 0 && stream.segProgress === 0) {
+            stream.headingDeg = rawTargetBearing;
+        }
+
+        // Anti-Teleport
+        if (stream.lastEmittedLatLng) {
+            const jumpDist = calculateDistance(stream.lastEmittedLatLng, { lat, lng });
+            if (jumpDist > ENGINE_CONSTANTS.MAX_JUMP_METERS) {
+                console.error(`[Stream] Anti-teleport triggered for ${deviceId}: Jump of ${Math.round(jumpDist)}m`);
+                pauseStream(deviceId);
+
+                console.error(JSON.stringify({
+                    error: "ANTI_TELEPORT_JUMP",
+                    deviceId,
+                    jumpMeters: jumpDist,
+                    dtMs,
+                    vMps: stream.vMps,
+                    segIndex: stream.segIndex
+                }));
+                return;
+            }
+        }
+
+        stream.lastEmittedLatLng = { lat, lng };
+
+        const message = {
+            type: 'MOCK_LOCATION',
+            payload: {
+                lat,
+                lng,
+                speed: stream.vMps * 3.6,
+                bearing: stream.headingDeg,
+                accuracy: stream.config.accuracy,
+                state: stream.state
+            },
+            meta: {
+                engineMode: 'distance',
+                dtMs,
+                sMeters: Math.round(stream.sMeters),
+                vMps: parseFloat(stream.vMps.toFixed(2)),
+                segIndex: stream.segIndex,
+                pointIndex: stream.segIndex,
+                totalPoints: stream.points.length,
+                routeId: stream.routeId,
+                timestamp: new Date().toISOString()
+            }
+        };
+
+        try {
+            ws.send(JSON.stringify(message));
+            stream.lastEmitAt = new Date().toISOString();
+
+            await updateStreamState(deviceId, {
+                currentIndex: stream.segIndex
+            });
+        } catch (error) {
+            await pauseStream(deviceId);
+            return;
+        }
+
+        if (stream.segIndex >= stream.points.length - 1 && stream.segProgress >= segDist - 0.5) {
+            if (stream.config.loop) {
+                stream.sMeters = 0;
+                stream.segIndex = 0;
+                stream.segProgress = 0;
+                stream.state = 'MOVE';
+                stream.lastEmittedLatLng = null;
+            } else {
+                await stopStream(deviceId);
+            }
+        }
+    } else {
+        // --- OLD INDEX-BASED ENGINE ---
+        const currentPoint = stream.points[stream.currentIndex];
+
+        if (stream.dwellTicksRemaining === 0 && currentPoint.dwellSeconds > 0 && stream.state === 'MOVE') {
+            const ticks = Math.ceil((currentPoint.dwellSeconds * 1000) / stream.config.intervalMs);
+            stream.dwellTicksRemaining = ticks;
+            stream.state = 'WAIT';
+        }
+
+        const isWaiting = stream.state === 'WAIT' && stream.dwellTicksRemaining > 0;
+        const effectiveSpeed = isWaiting ? 0 : stream.config.speed;
+
+        const nextPoint = stream.points[stream.currentIndex + 1] || stream.points[0];
+        const bearing = calculateBearing(currentPoint, nextPoint);
+
+        const message = {
+            type: 'MOCK_LOCATION',
+            payload: {
+                lat: currentPoint.lat,
+                lng: currentPoint.lng,
+                speed: effectiveSpeed,
+                bearing: bearing,
+                accuracy: stream.config.accuracy,
+                state: stream.state
+            },
+            meta: {
+                engineMode: 'index',
+                pointIndex: stream.currentIndex,
+                totalPoints: stream.points.length,
+                routeId: stream.routeId,
+                timestamp: new Date().toISOString()
+            }
+        };
+
+        try {
+            ws.send(JSON.stringify(message));
+            stream.lastEmitAt = new Date().toISOString();
+
+            await updateStreamState(deviceId, {
+                currentIndex: stream.currentIndex
+            });
+        } catch (error) {
+            console.error(`Failed to send to device ${deviceId}:`, error.message);
+            await pauseStream(deviceId);
+            return;
+        }
+
+        if (isWaiting) {
+            stream.dwellTicksRemaining--;
+            if (stream.dwellTicksRemaining <= 0) {
+                stream.dwellTicksRemaining = 0;
+                stream.state = 'MOVE';
+            }
+            return;
+        }
+
+        stream.currentIndex++;
+
+        if (stream.currentIndex >= stream.points.length) {
+            if (stream.config.loop) {
+                stream.currentIndex = 0;
+                stream.state = 'MOVE';
+                stream.dwellTicksRemaining = 0;
+            } else {
+                await stopStream(deviceId);
+            }
         }
     }
 }
 
-/**
- * Pause streaming for a device
- * @param {string} deviceId 
- * @returns {Object|null}
- */
 async function pauseStream(deviceId) {
     const stream = activeStreams.get(deviceId);
     if (!stream) return null;
@@ -236,7 +402,6 @@ async function pauseStream(deviceId) {
 
     stream.status = 'paused';
 
-    // Update PostgreSQL
     if (stream.dbId) {
         await prisma.stream.update({
             where: { id: stream.dbId },
@@ -244,29 +409,22 @@ async function pauseStream(deviceId) {
         });
     }
 
-    // Update Redis
     await updateStreamState(deviceId, { status: 'paused' });
 
     return {
         deviceId,
         status: stream.status,
-        currentIndex: stream.currentIndex,
+        currentIndex: stream.engineMode === 'distance' ? stream.segIndex : stream.currentIndex,
         totalPoints: stream.points.length
     };
 }
 
-/**
- * Resume streaming for a device
- * @param {string} deviceId 
- * @returns {Object|null}
- */
 async function resumeStream(deviceId) {
     const stream = activeStreams.get(deviceId);
     if (!stream || stream.status !== 'paused') return null;
 
     stream.status = 'running';
 
-    // Update PostgreSQL
     if (stream.dbId) {
         await prisma.stream.update({
             where: { id: stream.dbId },
@@ -274,29 +432,27 @@ async function resumeStream(deviceId) {
         });
     }
 
-    // Update Redis
     await updateStreamState(deviceId, { status: 'running' });
+
+    // Reset lastTickTs when resuming distance engine
+    if (stream.engineMode === 'distance') {
+        stream.lastTickTs = Date.now();
+    }
 
     stream.intervalId = setInterval(() => {
         emitNextCoordinate(deviceId);
     }, stream.config.intervalMs);
 
-    // Emit immediately
     emitNextCoordinate(deviceId);
 
     return {
         deviceId,
         status: stream.status,
-        currentIndex: stream.currentIndex,
+        currentIndex: stream.engineMode === 'distance' ? stream.segIndex : stream.currentIndex,
         totalPoints: stream.points.length
     };
 }
 
-/**
- * Stop streaming for a device
- * @param {string} deviceId 
- * @returns {Object|null}
- */
 async function stopStream(deviceId) {
     const stream = activeStreams.get(deviceId);
     if (!stream) return null;
@@ -305,7 +461,6 @@ async function stopStream(deviceId) {
         clearInterval(stream.intervalId);
     }
 
-    // Update PostgreSQL
     if (stream.dbId) {
         await prisma.stream.update({
             where: { id: stream.dbId },
@@ -316,13 +471,12 @@ async function stopStream(deviceId) {
         });
     }
 
-    // Delete Redis state
     await deleteStreamState(deviceId);
 
     const result = {
         deviceId,
         status: 'stopped',
-        finalIndex: stream.currentIndex,
+        finalIndex: stream.engineMode === 'distance' ? stream.segIndex : stream.currentIndex,
         totalPoints: stream.points.length
     };
 
@@ -331,13 +485,7 @@ async function stopStream(deviceId) {
     return result;
 }
 
-/**
- * Get stream status for a device
- * @param {string} deviceId 
- * @returns {Object|null}
- */
 async function getStreamStatus(deviceId) {
-    // First check in-memory
     const stream = activeStreams.get(deviceId);
     if (stream) {
         return {
@@ -345,7 +493,7 @@ async function getStreamStatus(deviceId) {
             routeId: stream.routeId,
             status: stream.status,
             state: stream.state,
-            currentIndex: stream.currentIndex,
+            currentIndex: stream.engineMode === 'distance' ? stream.segIndex : stream.currentIndex,
             totalPoints: stream.points.length,
             dwellTicksRemaining: stream.dwellTicksRemaining,
             config: stream.config,
@@ -354,7 +502,6 @@ async function getStreamStatus(deviceId) {
         };
     }
 
-    // Check Redis for hot state
     const redisState = await getStreamState(deviceId);
     if (redisState) {
         return {
@@ -370,10 +517,6 @@ async function getStreamStatus(deviceId) {
     return null;
 }
 
-/**
- * Get all active streams
- * @returns {Array}
- */
 function getAllStreams() {
     const streams = [];
     activeStreams.forEach((stream, deviceId) => {
@@ -382,28 +525,17 @@ function getAllStreams() {
             routeId: stream.routeId,
             status: stream.status,
             state: stream.state,
-            currentIndex: stream.currentIndex,
+            currentIndex: stream.engineMode === 'distance' ? stream.segIndex : stream.currentIndex,
             totalPoints: stream.points.length
         });
     });
     return streams;
 }
 
-/**
- * Check if device has active stream
- * @param {string} deviceId 
- * @returns {boolean}
- */
 function hasActiveStream(deviceId) {
     return activeStreams.has(deviceId);
 }
 
-/**
- * Get stream history for a device from PostgreSQL
- * @param {string} deviceId 
- * @param {number} limit 
- * @returns {Array}
- */
 async function getStreamHistory(deviceId, limit = 10) {
     return prisma.stream.findMany({
         where: { deviceId },

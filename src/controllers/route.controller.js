@@ -9,7 +9,18 @@ const orsService = require('../services/ors.service');
 const { parseGPX, validateCoordinates } = require('../utils/gpx.parser');
 const geospatialUtil = require('../utils/geospatial.util');
 const { resamplePoints, calculateBearing } = geospatialUtil;
+const routeSafetyService = require('../services/route.safety.service');
 const config = require('../config/config');
+
+function applySafetyGate(points) {
+    if (!config.ROUTE_SAFETY_GATE) return points;
+    let safePoints = routeSafetyService.sanitizePoints(points);
+    routeSafetyService.validatePoints(safePoints, config);
+    safePoints = routeSafetyService.simplifyPoints(safePoints, config.ROUTE_SIMPLIFY_METERS);
+    safePoints = routeSafetyService.resampleByDistance(safePoints, config.ROUTE_RESAMPLE_METERS);
+    routeSafetyService.detectSpikes(safePoints);
+    return safePoints;
+}
 
 /**
  * POST /api/routes/from-points
@@ -41,6 +52,8 @@ async function createFromPoints(req, res) {
                 error: 'Invalid coordinates. Each point must have valid lat and lng'
             });
         }
+
+        points = applySafetyGate(points);
 
         const route = await routeService.createRoute({ name, points }, userId);
 
@@ -97,8 +110,10 @@ async function createFromGPX(req, res) {
             });
         }
 
+        const safePoints = applySafetyGate(points);
+
         const route = await routeService.createRoute(
-            { name, points, sourceType: 'gpx' },
+            { name, points: safePoints, sourceType: 'gpx' },
             userId
         );
 
@@ -228,11 +243,13 @@ async function createFromAddresses(req, res) {
             pointsWithMetadata[pointsWithMetadata.length - 1].waitDuration = waitAtEndSeconds;
         }
 
+        const safePoints = applySafetyGate(pointsWithMetadata);
+
         // Step 6: Create route in database
         const route = await routeService.createRoute(
             {
                 name: name || `${originText} → ${destinationText}`,
-                points: pointsWithMetadata,
+                points: safePoints,
                 sourceType: 'ors'
             },
             userId
@@ -437,11 +454,13 @@ async function createFromAddressesWithStops(req, res) {
 
         console.log(`[RouteController] Total route: ${Math.round(totalDistance)}m, ${allPoints.length} points`);
 
+        const safePoints = applySafetyGate(allPoints);
+
         // Step 3: Persist
         const route = await routeService.createRoute(
             {
                 name: name || `${resolvedStops[0].label} -> ${resolvedStops[resolvedStops.length - 1].label}`,
-                points: allPoints,
+                points: safePoints,
                 sourceType: 'ors_stops'
             },
             userId
@@ -819,10 +838,12 @@ async function createFromWaypoints(req, res) {
         // ── Step 6: Persist route + waypoints ────────────────────────────
         const routeName = name || `${resolvedWaypoints[0].label || 'Origin'} → ${resolvedWaypoints[resolvedWaypoints.length - 1].label || 'Destination'}`;
 
+        const safePoints = applySafetyGate(pointsWithMeta);
+
         const route = await routeService.createRouteWithWaypoints(
             {
                 name: routeName,
-                points: pointsWithMeta,
+                points: safePoints,
                 waypoints: waypointsWithIndex,
                 sourceType: 'ors_waypoints'
             },
