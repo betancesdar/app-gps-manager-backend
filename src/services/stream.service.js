@@ -280,7 +280,7 @@ async function emitNextCoordinate(deviceId) {
                 payload: {
                     lat,
                     lng,
-                    speed: stream.vMps * 3.6,
+                    speed: stream.vMps,
                     bearing: stream.headingDeg,
                     accuracy: stream.config.accuracy,
                     state: stream.state
@@ -342,7 +342,7 @@ async function emitNextCoordinate(deviceId) {
                 payload: {
                     lat: currentPoint.lat,
                     lng: currentPoint.lng,
-                    speed: effectiveSpeed,
+                    speed: effectiveSpeed / 3.6,
                     bearing: bearing,
                     accuracy: stream.config.accuracy,
                     state: stream.state
