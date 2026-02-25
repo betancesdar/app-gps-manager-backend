@@ -89,7 +89,14 @@ async function deleteDevice(deviceId) {
         await redis.deleteWsAuth(deviceId);
         await redis.deleteWsConnection(deviceId);
         deviceConnections.delete(deviceId);
-        await prisma.device.delete({ where: { deviceId } });
+
+        await prisma.$transaction([
+            prisma.stream.deleteMany({ where: { deviceId } }),
+            prisma.auditLog.deleteMany({ where: { deviceId } }),
+            prisma.deviceCredential.deleteMany({ where: { deviceId } }),
+            prisma.device.delete({ where: { deviceId } })
+        ]);
+
         return true;
     } catch (error) {
         if (error.code === 'P2025') return false;
@@ -259,8 +266,7 @@ function verifyDeviceToken(token) {
 async function cleanupStaleDevices(olderThanSeconds) {
     const cutoff = new Date(Date.now() - olderThanSeconds * 1000);
 
-    // Delete devices that are old AND have no active streams (STARTED/PAUSED)
-    const result = await prisma.device.deleteMany({
+    const staleDevices = await prisma.device.findMany({
         where: {
             lastSeenAt: { lt: cutoff },
             streams: {
@@ -268,9 +274,22 @@ async function cleanupStaleDevices(olderThanSeconds) {
                     status: { in: ['STARTED', 'PAUSED'] }
                 }
             }
-        }
+        },
+        select: { deviceId: true }
     });
-    return result.count;
+
+    const deviceIds = staleDevices.map(d => d.deviceId);
+
+    if (deviceIds.length > 0) {
+        await prisma.$transaction([
+            prisma.stream.deleteMany({ where: { deviceId: { in: deviceIds } } }),
+            prisma.auditLog.deleteMany({ where: { deviceId: { in: deviceIds } } }),
+            prisma.deviceCredential.deleteMany({ where: { deviceId: { in: deviceIds } } }),
+            prisma.device.deleteMany({ where: { deviceId: { in: deviceIds } } })
+        ]);
+    }
+
+    return deviceIds.length;
 }
 
 // ═══════════════════════════════════════════════════════════════════

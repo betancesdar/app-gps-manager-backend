@@ -49,7 +49,7 @@ model Device {
   user         User      @relation(fields: [userId], references: [id])
   streams      Stream[]
   auditLogs    AuditLog[]
-  assignedRoute Route?   @relation("DeviceAssignedRoute", fields: [assignedRouteId], references: [id])
+  assignedRoute Route?   @relation("DeviceAssignedRoute", fields: [assignedRouteId], references: [id], onDelete: SetNull)
   assignedRouteId String? @map("assigned_route_id")
 
   // Auth
@@ -157,8 +157,8 @@ model Stream {
   stoppedAt DateTime? @map("stopped_at")
   
   // Relations
-  device    Device    @relation(fields: [deviceId], references: [deviceId])
-  route     Route     @relation(fields: [routeId], references: [id])
+  device    Device    @relation(fields: [deviceId], references: [deviceId], onDelete: Cascade)
+  route     Route     @relation(fields: [routeId], references: [id], onDelete: Cascade)
 
   @@map("streams")
   @@index([deviceId, status])
@@ -176,8 +176,8 @@ model AuditLog {
   createdAt DateTime @default(now()) @map("created_at")
   
   // Relations
-  user      User?    @relation(fields: [userId], references: [id])
-  device    Device?  @relation(fields: [deviceId], references: [deviceId])
+  user      User?    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  device    Device?  @relation(fields: [deviceId], references: [deviceId], onDelete: Cascade)
 
   @@map("audit_logs")
   @@index([action, createdAt])
