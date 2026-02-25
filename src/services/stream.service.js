@@ -147,13 +147,19 @@ async function startStream(deviceId, routeId, options = {}) {
 async function emitNextCoordinate(deviceId) {
     try {
         const stream = activeStreams.get(deviceId);
-        if (!stream || stream.status !== 'running') return;
+        if (!stream || (stream.status !== 'running' && stream.status !== 'paused')) return;
 
         const ws = deviceService.getDeviceConnection(deviceId);
         if (!ws || ws.readyState !== 1) {
-            await pauseStream(deviceId).catch(e => console.error('Error auto-pausing closed ws:', e));
+            if (stream.status !== 'paused') {
+                await pauseStream(deviceId).catch(e => console.error('Error auto-pausing closed ws:', e));
+            } else {
+                console.log(`[Stream] WS not ready for ${deviceId} while paused. Skipping tick.`);
+            }
             return;
         }
+
+        const isPaused = stream.status === 'paused';
 
         if (stream.engineMode === 'distance') {
             const now = Date.now();
@@ -166,29 +172,49 @@ async function emitNextCoordinate(deviceId) {
 
             const currentPoint = stream.points[stream.segIndex];
 
-            let isWaiting = false;
-            if (currentPoint.dwellSeconds > 0) {
+            let isWaiting = stream.state === 'WAIT';
+
+            if (!isPaused && currentPoint.dwellSeconds > 0) {
                 if (stream.dwellTicksRemaining === 0 && stream.state === 'MOVE') {
                     stream.vTargetMps = 0;
                     stream.state = 'WAIT';
+                    isWaiting = true;
                     const ticks = Math.ceil((currentPoint.dwellSeconds * 1000) / stream.config.intervalMs);
                     stream.dwellTicksRemaining = ticks;
                     console.log(`[Stream] enter WAIT device=${deviceId} ticks=${ticks}`);
                 }
+            }
 
-                if (stream.state === 'WAIT') {
-                    isWaiting = true;
-                    if (stream.vMps <= 0.1) {
-                        stream.vMps = 0;
+            if (isWaiting) {
+                if (stream.vMps <= 0.1) {
+                    stream.vMps = 0;
+                    if (!isPaused) {
                         stream.dwellTicksRemaining--;
-                        if (stream.dwellTicksRemaining <= 0) {
-                            stream.dwellTicksRemaining = 0;
-                            stream.state = 'MOVE';
-                            // restore target velocity
-                            stream.vTargetMps = stream.config.speed / 3.6;
-                            console.log(`[Stream] exit WAIT device=${deviceId}`);
-                        }
                     }
+
+                    // Throttle keepalive logs
+                    if (!stream.keepaliveTick) stream.keepaliveTick = 0;
+                    if (stream.keepaliveTick++ % 10 === 0) {
+                        console.log(`[Stream] Keepalive WAIT device=${deviceId} dwellRemaining=${stream.dwellTicksRemaining}`);
+                    }
+
+                    if (!isPaused && stream.dwellTicksRemaining <= 0) {
+                        stream.dwellTicksRemaining = 0;
+                        stream.state = 'MOVE';
+                        // restore target velocity
+                        stream.vTargetMps = stream.config.speed / 3.6;
+                        console.log(`[Stream] exit WAIT device=${deviceId}`);
+                        isWaiting = false;
+                    }
+                }
+            }
+
+            if (isPaused) {
+                stream.vMps = 0;
+                // Throttle keepalive logs
+                if (!stream.keepaliveTick) stream.keepaliveTick = 0;
+                if (stream.keepaliveTick++ % 10 === 0) {
+                    console.log(`[Stream] Keepalive PAUSED device=${deviceId}`);
                 }
             }
 
@@ -228,8 +254,19 @@ async function emitNextCoordinate(deviceId) {
             const p2 = stream.points[stream.segIndex + 1] || p1;
             const segDist = calculateDistance(p1, p2);
 
-            const fraction = segDist > 0 ? stream.segProgress / segDist : 0;
-            const { lat, lng } = interpolatePoint(p1, p2, Math.min(1, fraction));
+            let lat, lng;
+            const isKeepalive = stream.vMps === 0 && (isPaused || isWaiting);
+
+            if (isKeepalive) {
+                const keepalivePoint = stream.lastEmittedLatLng || p1;
+                lat = keepalivePoint.lat;
+                lng = keepalivePoint.lng;
+            } else {
+                const fraction = segDist > 0 ? stream.segProgress / segDist : 0;
+                const interpolated = interpolatePoint(p1, p2, Math.min(1, fraction));
+                lat = interpolated.lat;
+                lng = interpolated.lng;
+            }
 
             // Bearing & LookAhead Smoothing
             let futureDist = stream.segProgress + ENGINE_CONSTANTS.lookAheadMeters;
@@ -246,16 +283,18 @@ async function emitNextCoordinate(deviceId) {
             const futurePoint = stream.points[futureIndex + 1] || stream.points[futureIndex] || p2;
             const rawTargetBearing = calculateBearing({ lat, lng }, futurePoint);
 
-            if (stream.vMps > 0.5) {
-                let diff = rawTargetBearing - stream.headingDeg;
-                diff = ((diff + 540) % 360) - 180;
-                stream.headingDeg = (stream.headingDeg + diff * 0.3 + 360) % 360;
-            } else if (stream.segIndex === 0 && stream.segProgress === 0) {
-                stream.headingDeg = rawTargetBearing;
+            if (!isKeepalive) {
+                if (stream.vMps > 0.5) {
+                    let diff = rawTargetBearing - stream.headingDeg;
+                    diff = ((diff + 540) % 360) - 180;
+                    stream.headingDeg = (stream.headingDeg + diff * 0.3 + 360) % 360;
+                } else if (stream.segIndex === 0 && stream.segProgress === 0) {
+                    stream.headingDeg = rawTargetBearing;
+                }
             }
 
             // Anti-Teleport
-            if (stream.lastEmittedLatLng) {
+            if (stream.lastEmittedLatLng && !isKeepalive) {
                 const jumpDist = calculateDistance(stream.lastEmittedLatLng, { lat, lng });
                 if (jumpDist > ENGINE_CONSTANTS.MAX_JUMP_METERS) {
                     console.error(`[Stream] Anti-teleport triggered for ${deviceId}: Jump of ${Math.round(jumpDist)}m`);
@@ -275,15 +314,18 @@ async function emitNextCoordinate(deviceId) {
 
             stream.lastEmittedLatLng = { lat, lng };
 
+            let effectiveState = stream.state;
+            if (isPaused) effectiveState = 'PAUSED';
+
             const message = {
                 type: 'MOCK_LOCATION',
                 payload: {
                     lat,
                     lng,
-                    speed: stream.vMps,
+                    speed: stream.vMps, // Always in m/s (0 if stopped)
                     bearing: stream.headingDeg,
                     accuracy: stream.config.accuracy,
-                    state: stream.state
+                    state: effectiveState
                 },
                 meta: {
                     engineMode: 'distance',
@@ -297,6 +339,11 @@ async function emitNextCoordinate(deviceId) {
                     timestamp: new Date().toISOString()
                 }
             };
+
+            if (effectiveState === 'WAIT') {
+                const totalDwellMs = stream.dwellTicksRemaining * stream.config.intervalMs;
+                message.meta.dwellRemainingSeconds = Math.round(totalDwellMs / 1000);
+            }
 
             try {
                 ws.send(JSON.stringify(message));
@@ -325,36 +372,63 @@ async function emitNextCoordinate(deviceId) {
             // --- OLD INDEX-BASED ENGINE ---
             const currentPoint = stream.points[stream.currentIndex];
 
-            if (stream.dwellTicksRemaining === 0 && currentPoint.dwellSeconds > 0 && stream.state === 'MOVE') {
+            if (!isPaused && stream.dwellTicksRemaining === 0 && currentPoint.dwellSeconds > 0 && stream.state === 'MOVE') {
                 const ticks = Math.ceil((currentPoint.dwellSeconds * 1000) / stream.config.intervalMs);
                 stream.dwellTicksRemaining = ticks;
                 stream.state = 'WAIT';
+                console.log(`[Stream] enter WAIT device=${deviceId} ticks=${ticks}`);
             }
 
             const isWaiting = stream.state === 'WAIT' && stream.dwellTicksRemaining > 0;
-            const effectiveSpeed = isWaiting ? 0 : stream.config.speed;
+            const effectiveSpeed = (isWaiting || isPaused) ? 0 : stream.config.speed;
+
+            let lat, lng;
+            if (isWaiting || isPaused) {
+                const keepalivePoint = stream.lastEmittedLatLng || currentPoint;
+                lat = keepalivePoint.lat;
+                lng = keepalivePoint.lng;
+
+                if (!stream.keepaliveTick) stream.keepaliveTick = 0;
+                if (stream.keepaliveTick++ % 10 === 0) {
+                    console.log(`[Stream] Keepalive ${isPaused ? 'PAUSED' : 'WAIT'} device=${deviceId}`);
+                }
+            } else {
+                lat = currentPoint.lat;
+                lng = currentPoint.lng;
+            }
+
+            stream.lastEmittedLatLng = { lat, lng };
 
             const nextPoint = stream.points[stream.currentIndex + 1] || stream.points[0];
             const bearing = calculateBearing(currentPoint, nextPoint);
 
+            let effectiveState = stream.state;
+            if (isPaused) effectiveState = 'PAUSED';
+
             const message = {
                 type: 'MOCK_LOCATION',
                 payload: {
-                    lat: currentPoint.lat,
-                    lng: currentPoint.lng,
-                    speed: effectiveSpeed / 3.6,
+                    lat,
+                    lng,
+                    speed: effectiveSpeed / 3.6, // Always in m/s
                     bearing: bearing,
                     accuracy: stream.config.accuracy,
-                    state: stream.state
+                    state: effectiveState
                 },
                 meta: {
                     engineMode: 'index',
+                    dtMs: stream.config.intervalMs,
                     pointIndex: stream.currentIndex,
                     totalPoints: stream.points.length,
                     routeId: stream.routeId,
                     timestamp: new Date().toISOString()
                 }
             };
+
+            if (effectiveState === 'WAIT') {
+                const totalDwellMs = stream.dwellTicksRemaining * stream.config.intervalMs;
+                message.meta.dwellRemainingSeconds = Math.round(totalDwellMs / 1000);
+            }
 
             try {
                 ws.send(JSON.stringify(message));
@@ -365,17 +439,22 @@ async function emitNextCoordinate(deviceId) {
                 });
             } catch (error) {
                 console.error(`Failed to send to device ${deviceId}:`, error.message);
-                await pauseStream(deviceId).catch(e => console.error('Error auto-pausing index:', e));
+                if (!isPaused) {
+                    await pauseStream(deviceId).catch(e => console.error('Error auto-pausing index:', e));
+                }
                 return;
             }
 
-            if (isWaiting) {
-                stream.dwellTicksRemaining--;
-                if (stream.dwellTicksRemaining <= 0) {
-                    stream.dwellTicksRemaining = 0;
-                    stream.state = 'MOVE';
+            if (isWaiting || isPaused) {
+                if (isWaiting && !isPaused) {
+                    stream.dwellTicksRemaining--;
+                    if (stream.dwellTicksRemaining <= 0) {
+                        stream.dwellTicksRemaining = 0;
+                        stream.state = 'MOVE';
+                        console.log(`[Stream] exit WAIT device=${deviceId}`);
+                    }
                 }
-                return;
+                return; // Keepalive sent, do not advance index
             }
 
             stream.currentIndex++;
@@ -423,12 +502,14 @@ async function pauseStream(deviceId) {
             };
         }
 
-        if (stream.intervalId) {
-            clearInterval(stream.intervalId);
-            stream.intervalId = null;
-        }
+        // DO NOT clearInterval to allow keepalives
+        // if (stream.intervalId) {
+        //     clearInterval(stream.intervalId);
+        //     stream.intervalId = null;
+        // }
 
         stream.status = 'paused';
+        stream.state = 'PAUSED';
 
         if (stream.dbId) {
             try {
@@ -522,17 +603,21 @@ async function resumeStream(deviceId) {
 async function stopStream(deviceId) {
     try {
         const stream = activeStreams.get(deviceId);
-        const statusBefore = stream ? stream.status : 'not_running';
 
-        let finalIndex = 0;
-        let totalPoints = 0;
-        let dbId = null;
-
-        if (stream) {
-            finalIndex = stream.engineMode === 'distance' ? stream.segIndex : stream.currentIndex;
-            totalPoints = stream.points ? stream.points.length : 0;
-            dbId = stream.dbId;
+        if (!stream) {
+            return {
+                deviceId,
+                status: 'stopped',
+                finalIndex: 0,
+                totalPoints: 0,
+                noop: true
+            };
         }
+
+        const statusBefore = stream.status;
+        const finalIndex = stream.engineMode === 'distance' ? stream.segIndex : stream.currentIndex;
+        const totalPoints = stream.points ? stream.points.length : 0;
+        const dbId = stream.dbId;
 
         await cleanupStream(deviceId, `User requested stop`);
 
