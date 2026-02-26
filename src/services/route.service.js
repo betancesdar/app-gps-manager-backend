@@ -223,16 +223,30 @@ async function updateRouteConfig(routeId, configData) {
 
 /**
  * Delete route (cascade deletes points and waypoints)
+ * Unlinks assigned devices and removes active streams first.
  * @param {string} routeId 
  * @returns {boolean}
  */
 async function deleteRoute(routeId) {
     try {
-        await prisma.route.delete({
-            where: { id: routeId }
-        });
+        await prisma.$transaction([
+            // 1. Detach route from any assigned devices
+            prisma.device.updateMany({
+                where: { assignedRouteId: routeId },
+                data: { assignedRouteId: null }
+            }),
+            // 2. Delete historical streams tied to this route to satisfy FK constraints
+            prisma.stream.deleteMany({
+                where: { routeId }
+            }),
+            // 3. Finally delete the route (this cascades points and waypoints automatically)
+            prisma.route.delete({
+                where: { id: routeId }
+            })
+        ]);
         return true;
     } catch (error) {
+        console.error(`Error deleting route ${routeId}:`, error);
         if (error.code === 'P2025') return false;
         throw error;
     }
