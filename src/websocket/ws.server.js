@@ -162,40 +162,46 @@ wss.on('connection', async (ws, req) => {
     // ═══════════════════════════════════════════════════════════════════
     // Validation 5: Check device exists in PostgreSQL
     // ═══════════════════════════════════════════════════════════════════
-    const deviceExists = await deviceService.deviceExists(deviceId);
-    if (!deviceExists) {
-        console.log(`❌ WebSocket rejected: Device ${deviceId} not found in database`);
-        await auditService.log(auditService.ACTIONS.WS_AUTH_FAIL, {
-            userId: userId,
-            deviceId,
-            meta: { reason: 'not_in_database', ip: clientIp }
-        });
-        ws.close(4004, 'device not registered');
-        return;
+    if (clientType !== 'admin') {
+        const deviceExists = await deviceService.deviceExists(deviceId);
+        if (!deviceExists) {
+            console.log(`❌ WebSocket rejected: Device ${deviceId} not found in database`);
+            await auditService.log(auditService.ACTIONS.WS_AUTH_FAIL, {
+                userId: userId,
+                deviceId,
+                meta: { reason: 'not_in_database', ip: clientIp }
+            });
+            ws.close(4004, 'device not registered');
+            return;
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════
     // SUCCESS: Associate WebSocket connection with device
     // ═══════════════════════════════════════════════════════════════════
     try {
-        await deviceService.setDeviceConnection(deviceId, ws);
+        if (clientType !== 'admin') {
+            await deviceService.setDeviceConnection(deviceId, ws);
 
-        // Update device with last IP
-        await deviceService.updateDevice(deviceId, { lastIp: clientIp });
+            // Update device with last IP
+            await deviceService.updateDevice(deviceId, { lastIp: clientIp });
 
-        // Audit log
-        await auditService.log(auditService.ACTIONS.WS_CONNECT, {
-            userId: userId,
-            deviceId,
-            meta: { ip: clientIp }
-        });
+            // Audit log
+            await auditService.log(auditService.ACTIONS.WS_CONNECT, {
+                userId: userId,
+                deviceId,
+                meta: { ip: clientIp }
+            });
 
-        console.log(`✅ Device ${deviceId} connected via WebSocket`);
+            console.log(`✅ Device ${deviceId} connected via WebSocket`);
 
-        // Broadcast to dashboards
-        broadcast('DEVICE_CONNECTED', { deviceId, ip: clientIp });
+            // Broadcast to dashboards
+            broadcast('DEVICE_CONNECTED', { deviceId, ip: clientIp });
+        } else {
+            console.log(`✅ Admin Dashboard connected via WebSocket (User: ${userId})`);
+        }
     } catch (error) {
-        console.error(`❌ Failed to set device connection:`, error.message);
+        console.error(`❌ Failed to set connection:`, error.message);
         ws.close(4500, 'internal error');
         return;
     }
@@ -204,7 +210,7 @@ wss.on('connection', async (ws, req) => {
     ws.send(JSON.stringify({
         type: 'CONNECTED',
         payload: {
-            deviceId,
+            deviceId: deviceId || 'admin',
             message: 'Connected to GPS Mock Location Server',
             timestamp: new Date().toISOString()
         }
@@ -221,7 +227,9 @@ wss.on('connection', async (ws, req) => {
             switch (message.type) {
                 case 'PING':
                     // Refresh connection TTL in Redis
-                    await deviceService.refreshDeviceConnection(deviceId);
+                    if (clientType !== 'admin') {
+                        await deviceService.refreshDeviceConnection(deviceId);
+                    }
                     ws.send(JSON.stringify({
                         type: 'PONG',
                         timestamp: new Date().toISOString()
@@ -229,9 +237,11 @@ wss.on('connection', async (ws, req) => {
                     break;
 
                 case 'STATUS':
-                    await deviceService.updateDevice(deviceId, {
-                        lastStatus: message.payload
-                    });
+                    if (clientType !== 'admin') {
+                        await deviceService.updateDevice(deviceId, {
+                            lastStatus: message.payload
+                        });
+                    }
                     break;
 
                 case 'ACK':
@@ -250,6 +260,11 @@ wss.on('connection', async (ws, req) => {
     // Handle connection close
     // ═══════════════════════════════════════════════════════════════════
     ws.on('close', async (code, reason) => {
+        if (clientType === 'admin') {
+            console.log(`❌ Admin Dashboard disconnected (code: ${code})`);
+            return;
+        }
+
         console.log(`❌ Device ${deviceId} disconnected (code: ${code}, reason: ${reason?.toString() || 'none'})`);
 
         try {
@@ -275,6 +290,11 @@ wss.on('connection', async (ws, req) => {
     // Handle errors
     // ═══════════════════════════════════════════════════════════════════
     ws.on('error', async (error) => {
+        if (clientType === 'admin') {
+            console.error(`⚠️ WebSocket error for Admin:`, error.message);
+            return;
+        }
+
         console.error(`⚠️ WebSocket error for ${deviceId}:`, error.message);
 
         try {
