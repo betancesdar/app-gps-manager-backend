@@ -81,9 +81,8 @@ function getSocketPressure(ws) {
 /**
  * Evaluate if thresholds are crossed
  */
-function isPressured(ws) {
-    const { wsBuffered, tcpBuffered } = getSocketPressure(ws);
-    return wsBuffered > config.STREAM_WS_BUFFERED_MAX_BYTES || tcpBuffered > config.STREAM_WS_TCP_MAX_BYTES;
+function isPressured(wsBuffered, tcpBuffered, configOptions) {
+    return wsBuffered > configOptions.STREAM_WS_BUFFERED_MAX_BYTES || tcpBuffered > configOptions.STREAM_WS_TCP_MAX_BYTES;
 }
 
 /**
@@ -188,7 +187,7 @@ async function emitNextCoordinate(deviceId) {
             const now = Date.now();
             const { wsBuffered, tcpBuffered } = getSocketPressure(ws);
 
-            if (isPressured(ws)) {
+            if (isPressured(wsBuffered, tcpBuffered, config)) {
                 stream.skippedTicks++;
                 stream.pressureStrikes++;
 
