@@ -59,7 +59,31 @@ class StreamInstance {
         this.lastTickTs = Date.now();
         this.lastEmittedLatLng = null;
         this.engineMode = config.STREAM_DISTANCE_ENGINE ? 'distance' : 'index';
+
+        // Backpressure state
+        this.sentTicks = 0;
+        this.skippedTicks = 0;
+        this.pressureStrikes = 0;
+        this.pressureWindowStartMs = Date.now();
+        this.lastHealthLogTs = Date.now();
     }
+}
+
+/**
+ * Get socket buffer sizes (WS queue and underlying TCP buffer)
+ */
+function getSocketPressure(ws) {
+    const wsBuffered = ws?.bufferedAmount ?? 0;
+    const tcpBuffered = ws?._socket?.bufferSize ?? 0;
+    return { wsBuffered, tcpBuffered };
+}
+
+/**
+ * Evaluate if thresholds are crossed
+ */
+function isPressured(ws) {
+    const { wsBuffered, tcpBuffered } = getSocketPressure(ws);
+    return wsBuffered > config.STREAM_WS_BUFFERED_MAX_BYTES || tcpBuffered > config.STREAM_WS_TCP_MAX_BYTES;
 }
 
 /**
@@ -158,6 +182,86 @@ async function emitNextCoordinate(deviceId) {
             }
             return;
         }
+
+        // --- BACKPRESSURE GUARD & CIRCUIT BREAKER ---
+        if (config.STREAM_WS_BACKPRESSURE_ENABLED) {
+            const now = Date.now();
+            const { wsBuffered, tcpBuffered } = getSocketPressure(ws);
+
+            if (isPressured(ws)) {
+                stream.skippedTicks++;
+                stream.pressureStrikes++;
+
+                if (now - stream.pressureWindowStartMs > config.STREAM_WS_PRESSURE_WINDOW_MS) {
+                    stream.pressureStrikes = 1;
+                    stream.pressureWindowStartMs = now;
+                }
+
+                console.log(JSON.stringify({
+                    event: "ws_pressure_skip",
+                    deviceId,
+                    wsBuffered,
+                    tcpBuffered,
+                    thresholds: {
+                        wsMax: config.STREAM_WS_BUFFERED_MAX_BYTES,
+                        tcpMax: config.STREAM_WS_TCP_MAX_BYTES
+                    },
+                    strikes: stream.pressureStrikes,
+                    status: stream.status,
+                    state: stream.state,
+                    engineMode: stream.engineMode
+                }));
+
+                if (stream.pressureStrikes >= config.STREAM_WS_PRESSURE_STRIKES_TO_PAUSE) {
+                    console.log(JSON.stringify({
+                        event: "ws_pressure_auto_pause",
+                        deviceId,
+                        strikes: stream.pressureStrikes,
+                        windowMs: config.STREAM_WS_PRESSURE_WINDOW_MS,
+                        wsBuffered,
+                        tcpBuffered
+                    }));
+                    await pauseStream(deviceId).catch(e => console.error('Error auto-pausing on pressure:', e));
+                }
+
+                if (now - stream.lastHealthLogTs >= 10000) {
+                    stream.lastHealthLogTs = now;
+                    console.log(JSON.stringify({
+                        event: "stream_ws_health",
+                        deviceId,
+                        sentTicks: stream.sentTicks,
+                        skippedTicks: stream.skippedTicks,
+                        wsBuffered,
+                        tcpBuffered,
+                        status: stream.status,
+                        state: stream.state
+                    }));
+                }
+
+                stream.lastTickTs = now;
+                return;
+            } else {
+                if (now - stream.pressureWindowStartMs > config.STREAM_WS_PRESSURE_WINDOW_MS) {
+                    stream.pressureStrikes = 0;
+                    stream.pressureWindowStartMs = now;
+                }
+
+                if (now - stream.lastHealthLogTs >= 10000) {
+                    stream.lastHealthLogTs = now;
+                    console.log(JSON.stringify({
+                        event: "stream_ws_health",
+                        deviceId,
+                        sentTicks: stream.sentTicks,
+                        skippedTicks: stream.skippedTicks,
+                        wsBuffered,
+                        tcpBuffered,
+                        status: stream.status,
+                        state: stream.state
+                    }));
+                }
+            }
+        }
+        // --- END BACKPRESSURE GUARD ---
 
         const isPaused = stream.status === 'paused';
 
@@ -347,13 +451,14 @@ async function emitNextCoordinate(deviceId) {
 
             try {
                 ws.send(JSON.stringify(message));
+                stream.sentTicks++;
                 stream.lastEmitAt = new Date().toISOString();
 
                 await updateStreamState(deviceId, {
                     currentIndex: stream.segIndex
                 });
             } catch (error) {
-                await pauseStream(deviceId).catch(e => console.error('Error auto-pausing on ws error:', e));
+                console.log(JSON.stringify({ event: "ws_send_error", deviceId, msg: error.message }));
                 return;
             }
 
@@ -432,16 +537,14 @@ async function emitNextCoordinate(deviceId) {
 
             try {
                 ws.send(JSON.stringify(message));
+                stream.sentTicks++;
                 stream.lastEmitAt = new Date().toISOString();
 
                 await updateStreamState(deviceId, {
                     currentIndex: stream.currentIndex
                 });
             } catch (error) {
-                console.error(`Failed to send to device ${deviceId}:`, error.message);
-                if (!isPaused) {
-                    await pauseStream(deviceId).catch(e => console.error('Error auto-pausing index:', e));
-                }
+                console.log(JSON.stringify({ event: "ws_send_error", deviceId, msg: error.message }));
                 return;
             }
 

@@ -75,4 +75,11 @@ module.exports = {
     RATE_LIMIT_LOGIN_MAX: parseInt(process.env.RATE_LIMIT_LOGIN_MAX) || 10,       // per minute
     RATE_LIMIT_ACTIVATE_MAX: parseInt(process.env.RATE_LIMIT_ACTIVATE_MAX) || 30, // per minute
     RATE_LIMIT_IP_WINDOW: parseInt(process.env.RATE_LIMIT_IP_WINDOW) || 60,       // seconds
+
+    // Stream WS Backpressure
+    STREAM_WS_BACKPRESSURE_ENABLED: process.env.STREAM_WS_BACKPRESSURE_ENABLED === 'true',
+    STREAM_WS_BUFFERED_MAX_BYTES: parseInt(process.env.STREAM_WS_BUFFERED_MAX_BYTES) || 262144, // 256KB
+    STREAM_WS_TCP_MAX_BYTES: parseInt(process.env.STREAM_WS_TCP_MAX_BYTES) || 524288,           // 512KB
+    STREAM_WS_PRESSURE_STRIKES_TO_PAUSE: parseInt(process.env.STREAM_WS_PRESSURE_STRIKES_TO_PAUSE) || 10,
+    STREAM_WS_PRESSURE_WINDOW_MS: parseInt(process.env.STREAM_WS_PRESSURE_WINDOW_MS) || 15000,
 };
