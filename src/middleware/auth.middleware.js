@@ -46,6 +46,12 @@ function authMiddleware(req, res, next) {
         }
 
         if (error.name === 'JsonWebTokenError') {
+            if (error.message === 'invalid signature') {
+                return res.status(401).json({
+                    success: false,
+                    error: 'Sesión Inválida'
+                });
+            }
             return res.status(401).json({
                 success: false,
                 error: 'Invalid token'

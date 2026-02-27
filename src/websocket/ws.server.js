@@ -72,9 +72,8 @@ wss.on('connection', async (ws, req) => {
     if (!token) {
         console.log('❌ WebSocket rejected: No token provided');
         await auditService.log(auditService.ACTIONS.WS_AUTH_FAIL, {
-            deviceId,
-            meta: { reason: 'no_token', ip: clientIp }
-        });
+            meta: { reason: 'no_token', ip: clientIp, attemptedDeviceId: deviceId }
+        }).catch(() => { });
         ws.close(4001, 'auth required');
         return;
     }
@@ -84,7 +83,7 @@ wss.on('connection', async (ws, req) => {
     // ═══════════════════════════════════════════════════════════════════
     let isGlobalAdminOrUser = false;
     let decodedToken = null;
-    let jwtErrorMsg = null;
+    let isInvalidSignature = false;
     try {
         decodedToken = verifyToken(token);
         if (decodedToken && decodedToken.role !== 'device') {
@@ -92,6 +91,7 @@ wss.on('connection', async (ws, req) => {
         }
     } catch (e) {
         jwtErrorMsg = e.message;
+        if (e.message === 'invalid signature') isInvalidSignature = true;
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -152,10 +152,14 @@ wss.on('connection', async (ws, req) => {
     if (!isAuthorized) {
         console.log(`❌ WebSocket rejected: Not authorized`);
         await auditService.log(auditService.ACTIONS.WS_AUTH_FAIL, {
-            deviceId,
-            meta: { reason: 'auth_failed', ip: clientIp }
-        });
-        ws.close(4001, 'auth failed');
+            meta: { reason: 'auth_failed', ip: clientIp, attemptedDeviceId: deviceId }
+        }).catch(() => { });
+
+        if (isInvalidSignature) {
+            ws.close(4001, 'Sesión Inválida');
+        } else {
+            ws.close(4001, 'auth failed');
+        }
         return;
     }
 
@@ -167,10 +171,9 @@ wss.on('connection', async (ws, req) => {
         if (!deviceExists) {
             console.log(`❌ WebSocket rejected: Device ${deviceId} not found in database`);
             await auditService.log(auditService.ACTIONS.WS_AUTH_FAIL, {
-                userId: userId, // FIX: use `userId` (always in scope)
-                deviceId,
-                meta: { reason: 'not_in_database', ip: clientIp }
-            });
+                userId: userId,
+                meta: { reason: 'not_in_database', ip: clientIp, attemptedDeviceId: deviceId }
+            }).catch(() => { });
             ws.close(4004, 'device not registered');
             return;
         }

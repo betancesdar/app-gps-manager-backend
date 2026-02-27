@@ -248,10 +248,17 @@ async function confirmEnrollment(code, payload) {
 
     let device;
     try {
-        device = await prisma.device.upsert({
-            where: { deviceId },
-            update: updateData,
-            create: createData
+        device = await prisma.$transaction(async (tx) => {
+            // Limpiar registros antiguos del dispositivo si existe para evitar
+            // colisiones o mantener basura de sesiones anteriores
+            await tx.stream.deleteMany({ where: { deviceId } });
+            await tx.deviceCredential.deleteMany({ where: { deviceId } });
+
+            return await tx.device.upsert({
+                where: { deviceId },
+                update: updateData,
+                create: createData
+            });
         });
     } catch (dbErr) {
         console.error(`[Enrollment] DB error for device=${deviceId}:`, dbErr.message);
