@@ -43,7 +43,7 @@ model Device {
   lastSeenAt   DateTime  @default(now()) @map("last_seen_at")
   isConnected  Boolean   @default(false) @map("is_connected")
   lastIp       String?   @map("last_ip")
-  label        String?   // Human-readable name set during enrollment
+  label        String?   @map("label") // Human-readable name set during enrollment
   
   // Relations
   user         User      @relation(fields: [userId], references: [id])

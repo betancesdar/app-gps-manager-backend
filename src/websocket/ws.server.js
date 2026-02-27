@@ -139,7 +139,7 @@ wss.on('connection', async (ws, req) => {
             await deviceService.authorizeDeviceForWS(deviceId, userId || 'device', token);
         }
     } else {
-        // Redis valid
+        // Redis valid — restore userId and clientType from cache
         const cachedAuth = await deviceService.getWsAuthorization(deviceId);
         userId = cachedAuth?.userId;
         // Infer client type from userId (if it's 'device', then device)
@@ -167,7 +167,7 @@ wss.on('connection', async (ws, req) => {
         if (!deviceExists) {
             console.log(`❌ WebSocket rejected: Device ${deviceId} not found in database`);
             await auditService.log(auditService.ACTIONS.WS_AUTH_FAIL, {
-                userId: userId,
+                userId: userId, // FIX: use `userId` (always in scope)
                 deviceId,
                 meta: { reason: 'not_in_database', ip: clientIp }
             });
@@ -178,35 +178,46 @@ wss.on('connection', async (ws, req) => {
 
     // ═══════════════════════════════════════════════════════════════════
     // SUCCESS: Associate WebSocket connection with device
+    // FIX: connection store errors are NON-FATAL — log but keep socket open
     // ═══════════════════════════════════════════════════════════════════
     try {
         if (clientType !== 'admin') {
             await deviceService.setDeviceConnection(deviceId, ws);
-
             // Update device with last IP
             await deviceService.updateDevice(deviceId, { lastIp: clientIp });
-
-            // Audit log
-            await auditService.log(auditService.ACTIONS.WS_CONNECT, {
-                userId: userId,
-                deviceId,
-                meta: { ip: clientIp }
-            });
-
-            console.log(`✅ Device ${deviceId} connected via WebSocket`);
-
-            // Broadcast to dashboards
-            broadcast('DEVICE_CONNECTED', { deviceId, ip: clientIp });
+            console.log(`✅ Device ${deviceId} connection stored`);
         } else {
             console.log(`✅ Admin Dashboard connected via WebSocket (User: ${userId})`);
         }
-    } catch (error) {
-        console.error(`❌ Failed to set connection:`, error.message);
-        ws.close(4500, 'internal error');
-        return;
+    } catch (connError) {
+        // Non-fatal: log the warning but do NOT close the socket.
+        // The device is authenticated and the WS is valid — let it stay connected.
+        console.error(`⚠️ [WS] Failed to persist connection state for ${deviceId} (non-fatal):`, connError.message);
     }
 
-    // Send welcome message
+    // Audit log (also non-fatal)
+    try {
+        if (clientType !== 'admin' || !deviceId) {
+            await auditService.log(auditService.ACTIONS.WS_CONNECT, {
+                userId,  // FIX: use `userId` (always in scope)
+                deviceId: clientType !== 'admin' ? deviceId : undefined,
+                meta: { ip: clientIp }
+            });
+        }
+    } catch (auditErr) {
+        console.warn(`⚠️ [WS] Audit log failed (non-fatal):`, auditErr.message);
+    }
+
+    // Broadcast to dashboards (non-fatal)
+    try {
+        broadcast('DEVICE_CONNECTED', { deviceId, ip: clientIp });
+    } catch (broadcastErr) {
+        console.warn(`⚠️ [WS] Broadcast failed (non-fatal):`, broadcastErr.message);
+    }
+
+    console.log(`✅ Device ${deviceId} connected via WebSocket (clientType: ${clientType})`);
+
+    // Send CONNECTED frame to Android — always, regardless of internal errors above
     ws.send(JSON.stringify({
         type: 'CONNECTED',
         payload: {

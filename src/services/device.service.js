@@ -137,7 +137,7 @@ async function createEnrollment(adminUser, options = {}) {
         throw new Error('Rate limit exceeded for enrollment generation');
     }
 
-    // 2. Generate Code
+    // 2. Generate 6-digit Code
     let code;
     let attempts = 0;
     while (attempts < 3) {
@@ -159,7 +159,11 @@ async function createEnrollment(adminUser, options = {}) {
 
     // TTL: 10 minutes (default)
     const ttl = process.env.ENROLL_TTL_SECONDS || 600;
-    await redisClient.set(`enroll:${code}`, JSON.stringify(enrollData), 'EX', ttl);
+    const key = `enroll:${code}`;
+
+    await redisClient.set(key, JSON.stringify(enrollData), 'EX', ttl);
+
+    console.log(`[Enrollment] Created code=${code} ttl=${ttl}s for user=${adminUser.userId}`);
 
     return {
         enrollmentCode: code,
@@ -174,12 +178,21 @@ async function createEnrollment(adminUser, options = {}) {
  */
 async function confirmEnrollment(code, payload) {
     const redisClient = redis.getRedis();
-    const key = `enroll:${code}`;
 
-    // 1. Validate Code
+    // Normalize code: trim, remove spaces
+    const normalizedCode = (code || '').toString().replace(/\s+/g, '');
+    const key = `enroll:${normalizedCode}`;
+
+    // 1. Validate Code in Redis
     const dataStr = await redisClient.get(key);
+    const ttl = await redisClient.ttl(key);
+
+    console.log(`[Enrollment] Attempt: code=${normalizedCode} redisKeyExists=${!!dataStr} ttl=${ttl}`);
+
     if (!dataStr) {
-        throw new Error('Invalid or expired enrollment code');
+        const err = new Error('Invalid or expired enrollment code');
+        err.code = 'INVALID_CODE';
+        throw err;
     }
     const enrollData = JSON.parse(dataStr);
 
@@ -190,7 +203,7 @@ async function confirmEnrollment(code, payload) {
         deviceId = `android-${payload.deviceInfo.androidId}`;
     }
     if (!deviceId) {
-        // Fallback to random
+        // Fallback to random UUID prefix + epoch
         deviceId = `android-${uuidv4().split('-')[0]}-${Math.floor(Date.now() / 1000)}`;
     }
 
@@ -212,38 +225,57 @@ async function confirmEnrollment(code, payload) {
     }
 
     // 4. Upsert Device in DB
-    const device = await prisma.device.upsert({
-        where: { deviceId },
-        update: {
-            platform: payload.platform || 'android',
-            appVersion: payload.appVersion || '1.0.0',
-            lastSeenAt: new Date(),
-            label: enrollData.label || undefined
-        },
-        create: {
-            deviceId,
-            platform: payload.platform || 'android',
-            appVersion: payload.appVersion || '1.0.0',
-            label: enrollData.label || 'Enrolled Device',
-            lastSeenAt: new Date(),
-            user: { connect: { id: ownerUserId } }
-        }
-    });
+    // Build data objects dynamically so we never pass `undefined` to Prisma
+    // (passing undefined for an unknown field causes "Unknown argument" even on valid schemas
+    //  if the generated Prisma Client is stale — this is defensive and correct either way)
+    const updateData = {
+        platform: payload.platform || 'android',
+        appVersion: payload.appVersion || '1.0.0',
+        lastSeenAt: new Date()
+    };
+    if (enrollData.label) {
+        updateData.label = enrollData.label;
+    }
 
-    // 5. Generate JWT
+    const createData = {
+        deviceId,
+        platform: payload.platform || 'android',
+        appVersion: payload.appVersion || '1.0.0',
+        lastSeenAt: new Date(),
+        label: enrollData.label || 'Enrolled Device',
+        user: { connect: { id: ownerUserId } }
+    };
+
+    let device;
+    try {
+        device = await prisma.device.upsert({
+            where: { deviceId },
+            update: updateData,
+            create: createData
+        });
+    } catch (dbErr) {
+        console.error(`[Enrollment] DB error for device=${deviceId}:`, dbErr.message);
+        // Re-throw as a DB-level error (not an INVALID_CODE) so controller returns 500
+        const err = new Error('Database error during enrollment. Please retry.');
+        err.code = 'DB_ERROR';
+        throw err;
+    }
+
+    // 5. Generate JWT for the device
     const token = generateToken({
         role: 'device',
         deviceId: device.deviceId,
         sub: device.deviceId
     });
 
-    // 6. Cleanup Redis
+    // 6. Cleanup Redis ONLY after successful DB upsert
     await redisClient.del(key);
+    console.log(`[Enrollment] Success: code=${normalizedCode} claimed by device=${deviceId}`);
 
     return {
         deviceId: device.deviceId,
         token,
-        expiresIn: config.JWT_EXPIRES_IN || '7d', // e.g. "7d"
+        expiresIn: config.JWT_EXPIRES_IN || '7d',
         baseUrl: process.env.BASE_URL || `http://localhost:${config.PORT || 4000}`
     };
 }

@@ -31,11 +31,11 @@ COPY --from=deps /app/node_modules ./node_modules
 # Copy source code and prisma schema
 COPY . .
 
-# Generate Prisma client
+# Generate Prisma client with current schema
+# NOTE: We do NOT prune devDependencies here because `prisma` CLI is a
+# devDependency needed at container startup to re-run `npx prisma generate`
+# against the volume-mounted schema (see docker-compose CMD).
 RUN npx prisma generate
-
-# Remove dev dependencies for smaller image
-RUN npm prune --production
 
 # ═══════════════════════════════════════════════════════════════════
 # Stage 3: Runner (production image)
@@ -55,9 +55,17 @@ COPY --from=builder /app/src ./src
 COPY --from=builder /app/prisma ./prisma
 COPY --from=builder /app/package*.json ./
 
+# Copy configuration files for linting and formatting
+COPY --from=builder /app/.eslintrc.json ./
+COPY --from=builder /app/.prettierrc ./
+COPY --from=builder /app/.prettierignore ./
+
 # Create non-root user for security
 RUN addgroup --system --gid 1001 nodejs && \
-    adduser --system --uid 1001 gpsapp && \
+    adduser --system --uid 1001 gpsapp
+
+# Create logs directory and set permissions
+RUN mkdir -p /app/logs && \
     chown -R gpsapp:nodejs /app
 
 USER gpsapp

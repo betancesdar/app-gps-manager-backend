@@ -1,0 +1,4 @@
+{"error":"Connection is closed.","level":"error","message":"Error during shutdown","service":"gps-mock-backend","timestamp":"2026-02-21 17:09:56"}
+{"error":"Connection is closed.","level":"error","message":"Error during shutdown","service":"gps-mock-backend","timestamp":"2026-02-21 19:21:28"}
+{"error":"Connection is closed.","level":"error","message":"Error during shutdown","service":"gps-mock-backend","timestamp":"2026-02-22 01:12:04"}
+{"error":"Connection is closed.","level":"error","message":"Error during shutdown","service":"gps-mock-backend","timestamp":"2026-02-22 14:55:45"}

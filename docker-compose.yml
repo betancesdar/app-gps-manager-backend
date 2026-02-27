@@ -64,16 +64,34 @@ services:
       - DEFAULT_ADMIN_PASSWORD=${DEFAULT_ADMIN_PASSWORD:-admin123}
       - ORS_API_KEY=${ORS_API_KEY:-eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6IjVjYTdhOGU4OTFiNzRiZDE5ZTIxNTc0ODE1Yjc4NmM3IiwiaCI6Im11cm11cjY0In0=}
       - ORS_API_URL=${ORS_API_URL:-https://api.openrouteservice.org}
+      - ORS_GEOCODING_CACHE_TTL=${ORS_GEOCODING_CACHE_TTL:-86400}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
       - STREAM_TICK_MS=${STREAM_TICK_MS:-1000}
       - ENROLL_TTL_SECONDS=${ENROLL_TTL_SECONDS:-600}
+      - WS_AUTH_TTL=${WS_AUTH_TTL:-900}
+      - WS_CONN_TTL=${WS_CONN_TTL:-120}
+      - RATE_LIMIT_ADDRESSES=${RATE_LIMIT_ADDRESSES:-20}
+      - RATE_LIMIT_WINDOW=${RATE_LIMIT_WINDOW:-60}
       - BASE_URL=${BASE_URL:-http://localhost:4000}
+    volumes:
+      - ./src:/app/src
+      - ./prisma:/app/prisma
+      - ./package.json:/app/package.json
+      - ./package-lock.json:/app/package-lock.json
+      - ./.eslintrc.json:/app/.eslintrc.json
+      - ./.prettierrc:/app/.prettierrc
+      - ./.prettierignore:/app/.prettierignore
+      - ./logs:/app/logs
     depends_on:
       postgres:
         condition: service_healthy
       redis:
         condition: service_healthy
-    # Run migrations before starting the app
-    command: sh -c "npx prisma db push && node src/server.js"
+    # Run migrations before starting the app (Using nodemon for hot reload)
+    # 1. Generate client (fixes "Unknown argument suffix")
+    # 2. Push schema to DB
+    # 3. Start server with hot reload
+    command: sh -c "npx prisma generate && npx prisma db push && npx nodemon src/server.js"
     healthcheck:
       test: [ "CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:4000/health || exit 1" ]
       interval: 10s

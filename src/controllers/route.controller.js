@@ -416,6 +416,20 @@ async function createFromAddressesWithStops(req, res) {
                 };
             });
 
+            // Handle WAIT at the START of the FIRST segment (Origin)
+            if (i === 0 && start.waitSeconds > 0) {
+                const firstPoint = resampledSeg[0];
+                const repeats = Math.ceil(start.waitSeconds);
+                console.log(`[RouteController] Adding ${repeats} wait points at Origin (${start.label})`);
+                for (let r = 0; r < repeats; r++) {
+                    allPoints.push({
+                        ...firstPoint,
+                        speed: 0
+                    });
+                }
+                totalDuration += start.waitSeconds;
+            }
+
             // Prevent duplicate points at joins (except for the very first point of the route)
             // If allPoints is not empty, and the first point of this segment matches the last of allPoints, skip it.
             // However, ORS might return slightly different coords for the same place?

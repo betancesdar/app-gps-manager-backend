@@ -289,7 +289,9 @@ async function confirm(req, res) {
     try {
         // req.body: { enrollmentCode, platform, appVersion, deviceInfo... }
         const { enrollmentCode } = req.body;
-        if (!enrollmentCode) return res.status(400).json({ success: false, error: 'enrollmentCode required' });
+        if (!enrollmentCode) {
+            return res.status(400).json({ success: false, error: 'enrollmentCode required' });
+        }
 
         const result = await deviceService.confirmEnrollment(enrollmentCode, req.body);
 
@@ -298,8 +300,17 @@ async function confirm(req, res) {
             data: result
         });
     } catch (error) {
-        console.error('Confirm enrollment error:', error);
-        res.status(400).json({ success: false, error: error.message || 'Confirmation failed' });
+        // INVALID_CODE: enrollment code missing/expired → 400 (client fault)
+        if (error.code === 'INVALID_CODE') {
+            return res.status(400).json({ success: false, error: error.message });
+        }
+        // DB_ERROR or any unexpected error → 500 (server fault)
+        // This prevents false 400s when Prisma crashes on a valid enrollment code
+        console.error('Confirm enrollment error:', error.message);
+        return res.status(500).json({
+            success: false,
+            error: error.message || 'Enrollment confirmation failed. Please retry.'
+        });
     }
 }
 
