@@ -59,6 +59,7 @@ wss.on('connection', async (ws, req) => {
         || null;
 
     const clientIp = req.headers['x-forwarded-for'] || req.socket?.remoteAddress;
+    const ua = req.headers['user-agent'] || 'unknown';
 
     // Mask token in logs (show first 20 chars only)
     const tokenPreview = token ? token.substring(0, 20) + '...' : 'missing';
@@ -72,7 +73,7 @@ wss.on('connection', async (ws, req) => {
     if (!token) {
         console.log('❌ WebSocket rejected: No token provided');
         await auditService.log(auditService.ACTIONS.WS_AUTH_FAIL, {
-            meta: { reason: 'no_token', ip: clientIp, attemptedDeviceId: deviceId }
+            meta: { reason: 'no_token', ip: clientIp, ua, attemptedDeviceId: deviceId }
         }).catch(() => { });
         ws.close(4001, 'auth required');
         return;
@@ -84,6 +85,7 @@ wss.on('connection', async (ws, req) => {
     let isGlobalAdminOrUser = false;
     let decodedToken = null;
     let isInvalidSignature = false;
+    let jwtErrorMsg = null;
     try {
         decodedToken = verifyToken(token);
         if (decodedToken && decodedToken.role !== 'device') {
@@ -100,8 +102,8 @@ wss.on('connection', async (ws, req) => {
     if (!deviceId && !isGlobalAdminOrUser) {
         console.log('❌ WebSocket rejected: No deviceId provided for device connection');
         await auditService.log(auditService.ACTIONS.WS_AUTH_FAIL, {
-            meta: { reason: 'no_device_id', ip: clientIp }
-        });
+            meta: { reason: 'no_device_id', ip: clientIp, ua }
+        }).catch(() => { });
         ws.close(4003, 'deviceId required');
         return;
     }
@@ -151,14 +153,17 @@ wss.on('connection', async (ws, req) => {
 
     if (!isAuthorized) {
         console.log(`❌ WebSocket rejected: Not authorized`);
+        const failReason = isInvalidSignature ? 'invalid signature' : (jwtErrorMsg || 'auth_failed');
         await auditService.log(auditService.ACTIONS.WS_AUTH_FAIL, {
-            meta: { reason: 'auth_failed', ip: clientIp, attemptedDeviceId: deviceId }
+            meta: { reason: failReason, ip: clientIp, ua, attemptedDeviceId: deviceId }
         }).catch(() => { });
 
         if (isInvalidSignature) {
             ws.close(4001, 'Sesión Inválida');
+        } else if (jwtErrorMsg === 'jwt expired') {
+            ws.close(4001, 'Token expired');
         } else {
-            ws.close(4001, 'auth failed');
+            ws.close(4001, 'Not authorized');
         }
         return;
     }
@@ -171,8 +176,7 @@ wss.on('connection', async (ws, req) => {
         if (!deviceExists) {
             console.log(`❌ WebSocket rejected: Device ${deviceId} not found in database`);
             await auditService.log(auditService.ACTIONS.WS_AUTH_FAIL, {
-                userId: userId,
-                meta: { reason: 'not_in_database', ip: clientIp, attemptedDeviceId: deviceId }
+                meta: { reason: 'not_in_database', ip: clientIp, ua, attemptedDeviceId: deviceId }
             }).catch(() => { });
             ws.close(4004, 'device not registered');
             return;
