@@ -84,31 +84,32 @@ function resamplePoints(points, spacingMeters = 15) {
         const curr = points[i];
         const segmentDistance = calculateDistance(prev, curr);
 
-        // If this is the last point, always add it
-        if (i === points.length - 1) {
-            resampled.push(curr);
-            break;
-        }
-
-        // Accumulate distance and add intermediate points if needed
         let remainingDistance = segmentDistance;
         let segmentStart = prev;
 
         while (distanceFromLast + remainingDistance >= spacingMeters) {
-            // Calculate how far along this segment to place the next point
             const neededDistance = spacingMeters - distanceFromLast;
-            const fraction = neededDistance / calculateDistance(segmentStart, curr);
+            // Guard against division by zero 
+            const fraction = segmentDistance > 0 ? neededDistance / calculateDistance(segmentStart, curr) : 1;
 
-            const newPoint = interpolatePoint(segmentStart, curr, fraction);
+            const newPoint = interpolatePoint(segmentStart, curr, Math.min(1, Math.max(0, fraction)));
             resampled.push(newPoint);
 
-            // Update tracking variables
             remainingDistance -= neededDistance;
             distanceFromLast = 0;
             segmentStart = newPoint;
         }
 
         distanceFromLast += remainingDistance;
+    }
+
+    // Always push the absolute last point to ensure the route finishes exactly at the destination
+    const lastOriginal = points[points.length - 1];
+    const lastResampled = resampled[resampled.length - 1];
+
+    // Avoid putting duplicates at the immediate end
+    if (calculateDistance(lastResampled, lastOriginal) > 1) {
+        resampled.push(lastOriginal);
     }
 
     return resampled;
