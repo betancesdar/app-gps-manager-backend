@@ -99,6 +99,9 @@ async function startStream(deviceId, routeId, options = {}) {
     if (!route) {
         throw new Error('Route not found');
     }
+    if (!route.points || route.points.length < 2) {
+        throw new Error(`Route has only ${route.points ? route.points.length : 0} points. Minimum 2 points required to start simulation.`);
+    }
 
     if (activeStreams.has(deviceId)) {
         await stopStream(deviceId);
