@@ -33,10 +33,11 @@ const ENGINE_CONSTANTS = {
  * Tracks streaming state for a single device
  */
 class StreamInstance {
-    constructor(deviceId, routeId, points, streamConfig) {
+    constructor(deviceId, routeId, points, waypoints, streamConfig) {
         this.deviceId = deviceId;
         this.routeId = routeId;
         this.points = points;
+        this.waypoints = waypoints || [];
         this.config = { ...streamConfig };
         this.currentIndex = 0; // Legacy
         this.status = 'idle';
@@ -110,7 +111,7 @@ async function startStream(deviceId, routeId, options = {}) {
         loop: options.loop !== undefined ? options.loop : (route.config?.loop || config.STREAM_DEFAULTS.loop)
     };
 
-    const stream = new StreamInstance(deviceId, routeId, route.points, streamConfig);
+    const stream = new StreamInstance(deviceId, routeId, route.points, route.waypoints, streamConfig);
     stream.status = 'running';
     stream.startedAt = new Date().toISOString();
 
@@ -286,11 +287,18 @@ async function emitNextCoordinate(deviceId) {
                     stream.dwellTicksRemaining = ticks;
                     console.log(`[Stream] enter WAIT device=${deviceId} ticks=${ticks}`);
 
+                    // Attempt to find the semantic waypoint associated with this point
+                    const pointAbsIndex = stream.points.indexOf(currentPoint);
+                    const matchedWaypoint = stream.waypoints?.find(wp => wp.pointIndex === pointAbsIndex);
+
                     const { broadcast } = require('../websocket/ws.server');
                     broadcast('STREAM_WAITING_START', {
                         streamId: stream.dbId,
                         deviceId,
-                        waypointId: currentPoint.id,
+                        waypointId: currentPoint.id || matchedWaypoint?.id,
+                        kind: matchedWaypoint?.kind,          // e.g. 'PICKUP', 'STOP', 'DROPOFF'
+                        label: matchedWaypoint?.label,        // e.g. 'Stop 1'
+                        mode: matchedWaypoint?.mode,
                         remainingMs: currentPoint.dwellSeconds * 1000
                     });
                 }

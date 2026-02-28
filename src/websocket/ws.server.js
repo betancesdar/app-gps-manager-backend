@@ -23,9 +23,9 @@ const wss = new WebSocketServer({ noServer: true });
  */
 function broadcast(type, payload) {
     wss.clients.forEach(client => {
-        // Filter: Device events go only to admins (dashboards)
-        // Devices don't need to know about other devices connecting
-        if (type.startsWith('DEVICE_') && client.clientType !== 'admin') {
+        // Filter: Device and Stream events go only to admins (dashboards).
+        // Exceptions: MOCK_LOCATION goes to the specific device.
+        if ((type.startsWith('DEVICE_') || type.startsWith('STREAM_')) && client.clientType !== 'admin') {
             return;
         }
 
