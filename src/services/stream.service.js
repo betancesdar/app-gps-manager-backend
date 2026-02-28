@@ -285,6 +285,14 @@ async function emitNextCoordinate(deviceId) {
                     const ticks = Math.ceil((currentPoint.dwellSeconds * 1000) / stream.config.intervalMs);
                     stream.dwellTicksRemaining = ticks;
                     console.log(`[Stream] enter WAIT device=${deviceId} ticks=${ticks}`);
+
+                    const { broadcast } = require('../websocket/ws.server');
+                    broadcast('STREAM_WAITING_START', {
+                        streamId: stream.dbId,
+                        deviceId,
+                        waypointId: currentPoint.id,
+                        remainingMs: currentPoint.dwellSeconds * 1000
+                    });
                 }
             }
 
@@ -295,10 +303,19 @@ async function emitNextCoordinate(deviceId) {
                         stream.dwellTicksRemaining--;
                     }
 
-                    // Throttle keepalive logs
+                    // Throttle keepalive logs and broadcast TICK at ~1Hz
                     if (!stream.keepaliveTick) stream.keepaliveTick = 0;
-                    if (stream.keepaliveTick++ % 10 === 0) {
-                        console.log(`[Stream] Keepalive WAIT device=${deviceId} dwellRemaining=${stream.dwellTicksRemaining}`);
+                    stream.keepaliveTick++;
+
+                    const ticksPerSecond = Math.max(1, 1000 / stream.config.intervalMs);
+                    if (stream.keepaliveTick % Math.round(ticksPerSecond) === 0) {
+                        console.log(`[Stream] WAITING_TICK device=${deviceId} dwellRemaining=${stream.dwellTicksRemaining}`);
+                        const { broadcast } = require('../websocket/ws.server');
+                        broadcast('STREAM_WAITING_TICK', {
+                            streamId: stream.dbId,
+                            deviceId,
+                            remainingMs: stream.dwellTicksRemaining * stream.config.intervalMs
+                        });
                     }
 
                     if (!isPaused && stream.dwellTicksRemaining <= 0) {
@@ -815,6 +832,53 @@ async function getStreamStatus(deviceId) {
     return null;
 }
 
+/**
+ * Stop WAITING state and resume MOVE immediately
+ */
+async function skipDwell(deviceId) {
+    const stream = activeStreams.get(deviceId);
+    if (!stream) return { success: false, deviceId, message: 'Stream not found' };
+
+    if (stream.state === 'WAIT' || stream.dwellTicksRemaining > 0) {
+        stream.dwellTicksRemaining = 0;
+        stream.state = 'MOVE';
+        stream.vTargetMps = stream.config.speed / 3.6;
+
+        console.log(`[Stream] STREAM_WAITING_SKIP device=${deviceId}`);
+        const { broadcast } = require('../websocket/ws.server');
+        broadcast('STREAM_WAITING_SKIPPED', {
+            streamId: stream.dbId,
+            deviceId
+        });
+        return { success: true, deviceId, message: 'Dwell skipped' };
+    }
+    return { success: false, deviceId, message: 'Not currently waiting' };
+}
+
+/**
+ * Extend current WAITING state by N seconds
+ */
+async function extendDwell(deviceId, seconds) {
+    const stream = activeStreams.get(deviceId);
+    if (!stream) return { success: false, deviceId, message: 'Stream not found' };
+
+    if (stream.state === 'WAIT' || stream.dwellTicksRemaining > 0) {
+        const addedTicks = Math.ceil((seconds * 1000) / stream.config.intervalMs);
+        stream.dwellTicksRemaining += addedTicks;
+
+        console.log(`[Stream] STREAM_WAITING_EXTEND device=${deviceId} addedSeconds=${seconds}`);
+        const { broadcast } = require('../websocket/ws.server');
+        broadcast('STREAM_WAITING_EXTENDED', {
+            streamId: stream.dbId,
+            deviceId,
+            addedSeconds: seconds,
+            newRemainingMs: stream.dwellTicksRemaining * stream.config.intervalMs
+        });
+        return { success: true, deviceId, addedSeconds: seconds };
+    }
+    return { success: false, deviceId, message: 'Not currently waiting' };
+}
+
 function getAllStreams() {
     const streams = [];
     activeStreams.forEach((stream, deviceId) => {
@@ -855,5 +919,7 @@ module.exports = {
     getStreamStatus,
     getAllStreams,
     hasActiveStream,
-    getStreamHistory
+    getStreamHistory,
+    skipDwell,
+    extendDwell
 };

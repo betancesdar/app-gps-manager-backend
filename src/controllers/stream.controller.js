@@ -263,6 +263,71 @@ async function getStreamStatus(req, res) {
 }
 
 /**
+ * POST /api/stream/skip-dwell
+ * Skip current DWELL/WAIT state entirely
+ */
+async function skipDwell(req, res) {
+    try {
+        const { deviceId } = req.body;
+        const userId = req.user?.userId;
+
+        if (!deviceId) return res.status(400).json({ success: false, error: 'deviceId is required' });
+
+        const result = await streamService.skipDwell(deviceId);
+        if (!result || !result.success) {
+            return res.status(400).json({ success: false, error: result?.message || 'Failed to skip dwell' });
+        }
+
+        await auditService.log(auditService.ACTIONS.STREAM_WAITING_SKIP, { userId, deviceId });
+
+        return res.status(200).json({
+            success: true,
+            message: 'Dwell skipped successfully',
+            data: result
+        });
+    } catch (error) {
+        console.error('Skip dwell error:', error);
+        return res.status(500).json({ success: false, error: 'Failed to skip dwell' });
+    }
+}
+
+/**
+ * POST /api/stream/extend-dwell
+ * Add more time to the current DWELL/WAIT state
+ */
+async function extendDwell(req, res) {
+    try {
+        const { deviceId, seconds } = req.body;
+        const userId = req.user?.userId;
+
+        if (!deviceId) return res.status(400).json({ success: false, error: 'deviceId is required' });
+        if (!seconds || isNaN(seconds) || seconds <= 0) {
+            return res.status(400).json({ success: false, error: 'valid positive seconds parameter is required' });
+        }
+
+        const result = await streamService.extendDwell(deviceId, parseInt(seconds));
+        if (!result || !result.success) {
+            return res.status(400).json({ success: false, error: result?.message || 'Failed to extend dwell' });
+        }
+
+        await auditService.log(auditService.ACTIONS.STREAM_WAITING_EXTEND, {
+            userId,
+            deviceId,
+            meta: { addedSeconds: seconds }
+        });
+
+        return res.status(200).json({
+            success: true,
+            message: `Dwell extended by ${seconds}s successfully`,
+            data: result
+        });
+    } catch (error) {
+        console.error('Extend dwell error:', error);
+        return res.status(500).json({ success: false, error: 'Failed to extend dwell' });
+    }
+}
+
+/**
  * GET /api/stream/all
  * Get all active streams
  */
@@ -316,5 +381,7 @@ module.exports = {
     stopStream,
     getStreamStatus,
     getAllStreams,
-    getStreamHistory
+    getStreamHistory,
+    skipDwell,
+    extendDwell
 };

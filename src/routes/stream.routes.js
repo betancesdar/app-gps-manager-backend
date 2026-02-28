@@ -22,6 +22,12 @@ router.post('/resume', streamController.resumeStream);
 // POST /api/stream/stop
 router.post('/stop', streamController.stopStream);
 
+// POST /api/stream/skip-dwell
+router.post('/skip-dwell', streamController.skipDwell);
+
+// POST /api/stream/extend-dwell
+router.post('/extend-dwell', streamController.extendDwell);
+
 // GET /api/stream/status/:deviceId
 router.get('/status/:deviceId', streamController.getStreamStatus);
 
