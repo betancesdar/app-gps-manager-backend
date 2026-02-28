@@ -43,7 +43,10 @@ server.on('upgrade', (req, socket, head) => {
   });
 
   // Accept ONLY /ws — reject everything else with a proper HTTP response
-  if (req.url !== '/ws') {
+  // WARNING: req.url might contain query params, like /ws?token=123
+  const pathname = req.url.split('?')[0];
+
+  if (pathname !== '/ws') {
     logger.warn('Non-WebSocket upgrade rejected', { path: req.url, raw: rawUrl });
     socket.write('HTTP/1.1 400 Bad Request\r\n\r\n');
     socket.destroy();
