@@ -109,10 +109,14 @@ function simplifyPoints(points, toleranceMeters) {
     }
 
     if (dmax > toleranceMeters) {
+        // Recursive call
         const recResults1 = simplifyPoints(points.slice(0, index + 1), toleranceMeters);
         const recResults2 = simplifyPoints(points.slice(index), toleranceMeters);
-        return recResults1.slice(0, -1).concat(recResults2);
+
+        // Build the result list
+        return recResults1.slice(0, recResults1.length - 1).concat(recResults2);
     } else {
+        // Just the endpoints, intermediate points are removed
         return [first, last];
     }
 }
