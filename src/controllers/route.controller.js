@@ -680,6 +680,8 @@ async function createFromWaypoints(req, res) {
             return res.status(401).json({ success: false, error: 'User not authenticated' });
         }
 
+        const crypto = require('crypto');
+
         // ── Validate waypoints array ──────────────────────────────────────
         if (!waypoints || !Array.isArray(waypoints) || waypoints.length < 2) {
             return res.status(400).json({
@@ -751,6 +753,42 @@ async function createFromWaypoints(req, res) {
         }
 
         console.log(`[RouteController] Creating route from ${waypoints.length} waypoints`);
+
+        // ── Step 0: Idempotency Logic ─────────────────────────────────────
+        const payloadStr = JSON.stringify({ name, waypoints, profile, spacing });
+        const idempotencyKey = req.headers['x-idempotency-key'] || crypto.createHash('sha256').update(payloadStr).digest('hex');
+
+        // Check recent routes (last 10 minutes)
+        const recentDate = new Date(Date.now() - 10 * 60 * 1000);
+        const { prisma } = require('../lib/prisma');
+        const existingRoutes = await prisma.route.findMany({
+            where: {
+                userId: userId,
+                sourceType: 'ors_waypoints',
+                createdAt: { gte: recentDate }
+            }
+        });
+
+        const duplicate = existingRoutes.find(r => r.config && r.config.idempotencyKey === idempotencyKey);
+        if (duplicate) {
+            console.log(`[RouteController] Idempotency hit: returning existing route ${duplicate.id}`);
+            const fullRoute = await routeService.getRoute(duplicate.id);
+            if (fullRoute) {
+                return res.status(200).json({
+                    success: true,
+                    message: 'Route with waypoints returned (idempotency)',
+                    data: {
+                        routeId: fullRoute.routeId,
+                        name: fullRoute.name,
+                        distanceM: duplicate.config.distanceM || 0,
+                        durationS: duplicate.config.durationS || 0,
+                        pointsCount: fullRoute.points?.length || 0,
+                        pointSpacingMeters: spacing,
+                        waypoints: fullRoute.waypoints
+                    }
+                });
+            }
+        }
 
         // ── Step 1: Resolve all waypoints to coordinates ─────────────────
         const resolvedWaypoints = [];
@@ -863,6 +901,13 @@ async function createFromWaypoints(req, res) {
             },
             userId
         );
+
+        // Append metrics and idempotency key to route configuration
+        await routeService.updateRouteConfig(route.routeId, {
+            idempotencyKey,
+            distanceM: Math.round(distanceMeters),
+            durationS: Math.round(durationSeconds)
+        });
 
         // ── Step 7: Audit log ─────────────────────────────────────────────
         await auditService.log(auditService.ACTIONS.ROUTE_CREATE, {

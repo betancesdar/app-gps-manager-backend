@@ -54,6 +54,19 @@ class StreamInstance {
         this.lastWaitPointIndex = null;
         this.lastWaitExitAtMs = 0;
 
+        // Build deterministic wait plan
+        this.waitPlan = this.waypoints.map((wp) => ({
+            seq: wp.seq,
+            kind: wp.kind,
+            pointIndex: wp.pointIndex,
+            dwellSeconds: wp.dwellSeconds,
+            completed: false,
+            id: wp.id,
+            label: wp.label,
+            mode: wp.mode
+        })).sort((a, b) => a.seq - b.seq);
+        this.currentWaitPlanId = null;
+
         // Distance engine physics state
         this.sMeters = 0;
         this.vMps = 0;
@@ -283,50 +296,9 @@ async function emitNextCoordinate(deviceId) {
 
             const currentPoint = stream.points[stream.segIndex];
 
-            let isWaiting = stream.state === 'WAIT';
+            let isWaiting = stream.state === 'WAIT' || stream.state === 'FINISHED';
 
-            if (!isPaused && currentPoint.dwellSeconds > 0) {
-                if (stream.dwellTicksRemaining === 0 && stream.state === 'MOVE') {
-                    const waitPointIndex = stream.segIndex;
-                    if (stream.lastWaitPointIndex === waitPointIndex && (Date.now() - stream.lastWaitExitAtMs) < 2000) {
-                        // Anti-loop escape
-                        stream.segIndex = Math.min(stream.segIndex + 1, stream.points.length - 1);
-                        stream.segProgress = 0;
-                        console.log(JSON.stringify({
-                            event: "wait_reentry_blocked",
-                            deviceId,
-                            waitPointIndex,
-                            currentIndex: stream.segIndex,
-                            state: stream.state,
-                            status: stream.status
-                        }));
-                    } else {
-                        stream.vTargetMps = 0;
-                        stream.state = 'WAIT';
-                        isWaiting = true;
-                        const ticks = Math.ceil((currentPoint.dwellSeconds * 1000) / stream.config.intervalMs);
-                        stream.dwellTicksRemaining = ticks;
-                        console.log(`[Stream] enter WAIT device=${deviceId} ticks=${ticks}`);
-
-                        // Attempt to find the semantic waypoint associated with this point
-                        const pointAbsIndex = stream.points.indexOf(currentPoint);
-                        const matchedWaypoint = stream.waypoints?.find(wp => wp.pointIndex === pointAbsIndex);
-
-                        const { broadcast } = require('../websocket/ws.server');
-                        broadcast('STREAM_WAITING_START', {
-                            streamId: stream.dbId,
-                            deviceId,
-                            waypointId: currentPoint.id || matchedWaypoint?.id,
-                            kind: matchedWaypoint?.kind,          // e.g. 'PICKUP', 'STOP', 'DROPOFF'
-                            label: matchedWaypoint?.label,        // e.g. 'Stop 1'
-                            mode: matchedWaypoint?.mode,
-                            remainingMs: currentPoint.dwellSeconds * 1000
-                        });
-                    }
-                }
-            }
-
-            if (isWaiting) {
+            if (isWaiting && stream.state !== 'FINISHED') {
                 if (stream.vMps <= 0.1) {
                     stream.vMps = 0;
                     if (!isPaused) {
@@ -350,26 +322,48 @@ async function emitNextCoordinate(deviceId) {
 
                     if (!isPaused && stream.dwellTicksRemaining <= 0) {
                         stream.dwellTicksRemaining = 0;
-                        stream.state = 'MOVE';
-                        // restore target velocity
-                        stream.vTargetMps = stream.config.speed / 3.6;
-                        console.log(`[Stream] exit WAIT device=${deviceId}`);
-                        isWaiting = false;
 
-                        stream.lastWaitPointIndex = stream.segIndex;
-                        stream.lastWaitExitAtMs = Date.now();
-                        const fromIndex = stream.segIndex;
-                        stream.segIndex = Math.min(stream.segIndex + 1, stream.points.length - 1);
-                        stream.segProgress = 0;
+                        // Mark as completed
+                        const currentWait = stream.waitPlan.find(w => w.id === stream.currentWaitPlanId);
+                        if (currentWait) {
+                            currentWait.completed = true;
+                        }
 
-                        console.log(JSON.stringify({
-                            event: "wait_exit_advance",
-                            deviceId,
-                            fromIndex,
-                            toIndex: stream.segIndex,
-                            waitPointIndex: stream.lastWaitPointIndex
-                        }));
+                        if (currentWait && currentWait.kind === 'destination') {
+                            stream.state = 'FINISHED'; // Park forever
+                            isWaiting = true;
+                            console.log(`[Stream] reached DESTINATION device=${deviceId}, parking indefinitely`);
+                        } else {
+                            stream.state = 'MOVE';
+                            // restore target velocity
+                            stream.vTargetMps = stream.config.speed / 3.6;
+                            console.log(`[Stream] exit WAIT device=${deviceId}`);
+                            isWaiting = false;
+
+                            stream.lastWaitPointIndex = stream.segIndex;
+                            stream.lastWaitExitAtMs = Date.now();
+                            const fromIndex = stream.segIndex;
+                            // Explicitly skip 1 segment ahead to prevent re-entry
+                            stream.segIndex = Math.min(stream.segIndex + 1, stream.points.length - 1);
+                            stream.segProgress = 0;
+
+                            console.log(JSON.stringify({
+                                event: "wait_exit_advance",
+                                deviceId,
+                                fromIndex,
+                                toIndex: stream.segIndex,
+                                waitPointIndex: stream.lastWaitPointIndex
+                            }));
+                        }
                     }
+                }
+            } else if (stream.state === 'FINISHED') {
+                stream.vMps = 0;
+                stream.vTargetMps = 0;
+                // Just keepalive ticks internally
+                if (!stream.keepaliveTick) stream.keepaliveTick = 0;
+                if (stream.keepaliveTick++ % 10 === 0) {
+                    console.log(`[Stream] parked at FINISHED destination device=${deviceId}`);
                 }
             }
 
@@ -397,31 +391,72 @@ async function emitNextCoordinate(deviceId) {
             let metersToAdvance = stream.vMps * dt;
             metersToAdvance = Math.min(metersToAdvance, maxMetersPerTick);
 
-            // Segment Traversal
-            stream.sMeters += metersToAdvance;
-            stream.segProgress += metersToAdvance;
+            // Segment Traversal (ONLY IF NOT WAITING/PAUSED/FINISHED)
+            let crossWait = null;
+            if (!isWaiting && !isPaused && stream.state === 'MOVE') {
+                const prevSegIndex = stream.segIndex;
 
-            while (stream.segIndex < stream.points.length - 1) {
-                const p1 = stream.points[stream.segIndex];
-                const p2 = stream.points[stream.segIndex + 1];
-                const segDist = calculateDistance(p1, p2);
+                stream.sMeters += metersToAdvance;
+                stream.segProgress += metersToAdvance;
 
-                if (stream.segProgress >= segDist && segDist > 0) {
-                    stream.segIndex++;
-                    stream.segProgress -= segDist;
-                } else {
-                    break;
+                while (stream.segIndex < stream.points.length - 1) {
+                    const p1 = stream.points[stream.segIndex];
+                    const p2 = stream.points[stream.segIndex + 1];
+                    const segDist = calculateDistance(p1, p2);
+
+                    if (stream.segProgress >= segDist && segDist > 0) {
+                        stream.segIndex++;
+                        stream.segProgress -= segDist;
+                    } else {
+                        break;
+                    }
+                }
+
+                // Check for crossing a wait point
+                crossWait = stream.waitPlan.find(w =>
+                    w.pointIndex >= prevSegIndex &&
+                    w.pointIndex <= stream.segIndex &&
+                    !w.completed &&
+                    w.dwellSeconds > 0
+                );
+
+                if (crossWait) {
+                    // Snap exactly to wait point
+                    stream.segIndex = crossWait.pointIndex;
+                    stream.segProgress = 0;
+                    stream.vMps = 0;
+                    stream.vTargetMps = 0;
+                    stream.state = 'WAIT';
+                    isWaiting = true;
+
+                    const ticks = Math.ceil((crossWait.dwellSeconds * 1000) / stream.config.intervalMs);
+                    stream.dwellTicksRemaining = ticks;
+                    stream.currentWaitPlanId = crossWait.id;
+
+                    console.log(`[Stream] cross detection enter WAIT device=${deviceId} pointIndex=${crossWait.pointIndex}`);
+
+                    const { broadcast } = require('../websocket/ws.server');
+                    broadcast('STREAM_WAITING_START', {
+                        streamId: stream.dbId,
+                        deviceId,
+                        waypointId: crossWait.id,
+                        kind: crossWait.kind,
+                        label: crossWait.label,
+                        mode: crossWait.mode,
+                        remainingMs: crossWait.dwellSeconds * 1000
+                    });
                 }
             }
+
 
             const p1 = stream.points[stream.segIndex];
             const p2 = stream.points[stream.segIndex + 1] || p1;
             const segDist = calculateDistance(p1, p2);
 
             let lat, lng;
-            const isKeepalive = stream.vMps === 0 && (isPaused || isWaiting);
+            const isKeepalive = stream.vMps === 0 && (isPaused || isWaiting || stream.state === 'FINISHED');
 
-            if (isKeepalive) {
+            if (isKeepalive || stream.state === 'FINISHED') {
                 const keepalivePoint = stream.lastEmittedLatLng || p1;
                 lat = keepalivePoint.lat;
                 lng = keepalivePoint.lng;
@@ -522,7 +557,7 @@ async function emitNextCoordinate(deviceId) {
                 return;
             }
 
-            if (stream.segIndex >= stream.points.length - 1 && stream.segProgress >= segDist - 0.5) {
+            if (!isWaiting && !isPaused && stream.segIndex >= stream.points.length - 1 && stream.segProgress >= segDist - 0.5) {
                 if (stream.config.loop) {
                     stream.sMeters = 0;
                     stream.segIndex = 0;

@@ -376,21 +376,33 @@ async function getDirectionsMulti(waypoints, profile = 'driving-car') {
     try {
         console.log(`[ORS] Getting multi-waypoint directions: ${waypoints.length} points (${profile})`);
 
-        const response = await axios.post(
-            `${ORS_BASE_URL}/v2/directions/${profile}/geojson`,
-            {
-                coordinates,
-                instructions: false,
-                elevation: false
+        const axiosConfig = {
+            headers: {
+                'Authorization': ORS_API_KEY,
+                'Content-Type': 'application/json'
             },
-            {
-                headers: {
-                    'Authorization': ORS_API_KEY,
-                    'Content-Type': 'application/json'
-                },
-                timeout: 20000 // 20 second timeout for multi-waypoint
+            timeout: 30000 // 30 second timeout for multi-waypoint
+        };
+
+        const payload = {
+            coordinates,
+            instructions: false,
+            elevation: false
+        };
+
+        let response;
+        try {
+            response = await axios.post(`${ORS_BASE_URL}/v2/directions/${profile}/geojson`, payload, axiosConfig);
+        } catch (initialError) {
+            const status = initialError.response?.status;
+            if (status === 429 || status >= 500 || initialError.code === 'ECONNABORTED' || initialError.message.includes('timeout')) {
+                console.warn(`[ORS] Retrying multi-waypoint due to ${status || 'timeout/network'} after 1000ms`);
+                await new Promise(res => setTimeout(res, 1000));
+                response = await axios.post(`${ORS_BASE_URL}/v2/directions/${profile}/geojson`, payload, axiosConfig);
+            } else {
+                throw initialError;
             }
-        );
+        }
 
         const features = response.data?.features;
 
