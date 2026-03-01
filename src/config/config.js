@@ -57,7 +57,7 @@ module.exports = {
     STREAM_DEFAULTS: {
         speed: parseFloat(process.env.STREAM_DEFAULT_SPEED) || 30,     // km/h
         accuracy: parseFloat(process.env.STREAM_DEFAULT_ACCURACY) || 5, // meters
-        intervalMs: parseInt(process.env.STREAM_TICK_MS) || (process.env.STREAM_DISTANCE_ENGINE === 'true' ? 500 : 1000), // Default 500ms IF distance engine enabled
+        intervalMs: parseInt(process.env.STREAM_TICK_MS) || 1000, // Default 1000ms — stable for 13+ devices through Cloudflare (override via STREAM_TICK_MS=500 if desired)
         loop: process.env.STREAM_DEFAULT_LOOP === 'true' || false
     },
 

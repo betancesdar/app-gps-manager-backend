@@ -778,6 +778,14 @@ async function resumeStream(deviceId) {
             };
         }
 
+        // Restore state correctly:
+        // If paused mid-WAIT, dwellTicksRemaining will still be > 0 — preserve WAIT
+        // Otherwise restore MOVE
+        if (stream.dwellTicksRemaining > 0) {
+            stream.state = 'WAIT';
+        } else {
+            stream.state = 'MOVE';
+        }
         stream.status = 'running';
 
         if (stream.dbId) {
@@ -916,6 +924,11 @@ async function getStreamStatus(deviceId) {
             currentIndex: stream.engineMode === 'distance' ? stream.segIndex : stream.currentIndex,
             totalPoints: stream.points.length,
             dwellTicksRemaining: stream.dwellTicksRemaining,
+            dwellRemainingSeconds: stream.dwellTicksRemaining > 0
+                ? Math.round((stream.dwellTicksRemaining * stream.config.intervalMs) / 1000)
+                : null,
+            speedApplied: parseFloat((stream.vMps * 3.6).toFixed(1)),
+            engineMode: stream.engineMode,
             config: stream.config,
             startedAt: stream.startedAt,
             lastEmitAt: stream.lastEmitAt
