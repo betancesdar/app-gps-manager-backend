@@ -22,6 +22,13 @@ const wss = new WebSocketServer({ noServer: true });
  * @param {Object} payload 
  */
 function broadcast(type, payload) {
+    // Serialize once to prevent event loop blocking on massive broadcasts
+    const messageStr = JSON.stringify({
+        type,
+        payload,
+        timestamp: new Date().toISOString()
+    });
+
     wss.clients.forEach(client => {
         // Filter: Device and Stream events go only to admins (dashboards).
         // Exceptions: MOCK_LOCATION goes to the specific device.
@@ -30,14 +37,26 @@ function broadcast(type, payload) {
         }
 
         if (client.readyState === 1) { // OPEN
-            client.send(JSON.stringify({
-                type,
-                payload,
-                timestamp: new Date().toISOString()
-            }));
+            client.send(messageStr);
         }
     });
 }
+
+// ── Heartbeat Loop (Server -> Client) ─────────────────────────────────────────
+const heartbeatInterval = setInterval(() => {
+    wss.clients.forEach((ws) => {
+        if (ws.isAlive === false) {
+            console.log(`[WS] 💀 Terminating dead connection (No PONG received in 25s)`);
+            return ws.terminate();
+        }
+        ws.isAlive = false;
+        ws.ping();
+    });
+}, 25000);
+
+wss.on('close', () => {
+    clearInterval(heartbeatInterval);
+});
 
 // Handle WebSocket connections
 wss.on('connection', async (ws, req) => {
@@ -66,6 +85,12 @@ wss.on('connection', async (ws, req) => {
     console.log(`🔐 WS CONNECT token: ${tokenPreview}`);
     console.log(`📱 WS CONNECT deviceId: ${deviceId || 'missing'}`);
     console.log(`🌐 WS CONNECT IP: ${clientIp}`);
+
+    // Heartbeat setup for this client
+    ws.isAlive = true;
+    ws.on('pong', () => {
+        ws.isAlive = true;
+    });
 
     // ═══════════════════════════════════════════════════════════════════
     // Validation 1: Check token exists
@@ -278,12 +303,13 @@ wss.on('connection', async (ws, req) => {
     // Handle connection close
     // ═══════════════════════════════════════════════════════════════════
     ws.on('close', async (code, reason) => {
+        const reasonStr = reason ? reason.toString() : 'none';
         if (clientType === 'admin') {
-            console.log(`❌ Admin Dashboard disconnected (code: ${code})`);
+            console.log(`❌ [WS CLOSE] Admin Dashboard disconnected | Code: ${code} | Reason: ${reasonStr}`);
             return;
         }
 
-        console.log(`❌ Device ${deviceId} disconnected (code: ${code}, reason: ${reason?.toString() || 'none'})`);
+        console.log(`❌ [WS CLOSE] Device ${deviceId} disconnected | Code: ${code} | Reason: ${reasonStr}`);
 
         try {
             await deviceService.removeDeviceConnection(deviceId);
@@ -309,11 +335,11 @@ wss.on('connection', async (ws, req) => {
     // ═══════════════════════════════════════════════════════════════════
     ws.on('error', async (error) => {
         if (clientType === 'admin') {
-            console.error(`⚠️ WebSocket error for Admin:`, error.message);
+            console.error(`⚠️ [WS ERROR] Admin error: ${error.message} | Stack: ${error.stack}`);
             return;
         }
 
-        console.error(`⚠️ WebSocket error for ${deviceId}:`, error.message);
+        console.error(`⚠️ [WS ERROR] Device ${deviceId} error: ${error.message} | Stack: ${error.stack}`);
 
         try {
             await deviceService.removeDeviceConnection(deviceId);
