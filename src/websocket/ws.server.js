@@ -50,7 +50,12 @@ const heartbeatInterval = setInterval(() => {
             return ws.terminate();
         }
         ws.isAlive = false;
-        ws.ping();
+        try {
+            ws.ping();
+        } catch (error) {
+            console.log(`[WS] 💀 Terminating ping-failed connection.`);
+            return ws.terminate();
+        }
     });
 }, 25000);
 
