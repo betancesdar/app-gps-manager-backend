@@ -15,17 +15,25 @@ const { prisma } = require('../lib/prisma');
  */
 async function log(action, { userId = null, deviceId = null, meta = null } = {}) {
     try {
+        let deviceOk = null;
+        if (deviceId) {
+            deviceOk = await prisma.device.findUnique({
+                where: { id: deviceId },
+                select: { id: true }
+            });
+        }
+
         await prisma.auditLog.create({
             data: {
                 action,
                 userId,
-                deviceId,
-                meta
+                deviceId: deviceOk ? deviceId : null,
+                meta: { ...(meta || {}), attemptedDeviceId: deviceId || null }
             }
         });
     } catch (error) {
         // Don't fail the main operation if audit logging fails
-        console.error('⚠️ Audit log failed:', error.message);
+        console.warn(`⚠️ Audit log failed for ${action}:`, error?.message || error);
     }
 }
 

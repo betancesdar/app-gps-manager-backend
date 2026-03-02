@@ -195,13 +195,28 @@ async function emitNextCoordinate(deviceId) {
 
         const ws = deviceService.getDeviceConnection(deviceId);
         if (!ws || ws.readyState !== 1) {
+            stream.wsMissCount = (stream.wsMissCount || 0) + 1;
+
+            // Auto cleanup after 10 ticks without WS socket
+            if (stream.wsMissCount > 10) {
+                console.warn(`[Stream] WS not ready for ${deviceId} for too long. Auto-stopping stream.`);
+                await stopStream(deviceId).catch(e => console.error('Error auto-stopping orphaned stream:', e));
+                return;
+            }
+
             if (stream.status !== 'paused') {
                 await pauseStream(deviceId).catch(e => console.error('Error auto-pausing closed ws:', e));
             } else {
-                console.log(`[Stream] WS not ready for ${deviceId} while paused. Skipping tick.`);
+                // Throttle spammy "WS not ready" logs when paused
+                if (stream.wsMissCount % 5 === 1) {
+                    console.log(`[Stream] WS not ready for ${deviceId} while paused. Skipping tick (miss #${stream.wsMissCount}).`);
+                }
             }
             return;
         }
+
+        // Reset miss count if WS recovers
+        stream.wsMissCount = 0;
 
         // --- BACKPRESSURE GUARD & CIRCUIT BREAKER ---
         if (config.STREAM_WS_BACKPRESSURE_ENABLED) {
@@ -253,8 +268,8 @@ async function emitNextCoordinate(deviceId) {
                         skippedTicks: stream.skippedTicks,
                         wsBuffered,
                         tcpBuffered,
-                        status: stream.status,
-                        state: stream.state
+                        status: String(stream.status || 'unknown'),
+                        state: String(stream.state || 'MOVE')
                     }));
                 }
 
@@ -275,8 +290,8 @@ async function emitNextCoordinate(deviceId) {
                         skippedTicks: stream.skippedTicks,
                         wsBuffered,
                         tcpBuffered,
-                        status: stream.status,
-                        state: stream.state
+                        status: String(stream.status || 'unknown'),
+                        state: String(stream.state || 'MOVE')
                     }));
                 }
             }
@@ -835,43 +850,40 @@ async function resumeStream(deviceId) {
 async function stopStream(deviceId) {
     try {
         const stream = activeStreams.get(deviceId);
+        const statusBefore = stream ? stream.status : 'not_running';
+        const finalIndex = stream ? (stream.engineMode === 'distance' ? stream.segIndex : stream.currentIndex) : 0;
+        const totalPoints = stream?.points ? stream.points.length : 0;
 
-        if (!stream) {
-            return {
-                deviceId,
-                status: 'stopped',
-                finalIndex: 0,
-                totalPoints: 0,
-                noop: true
-            };
-        }
-
-        const statusBefore = stream.status;
-        const finalIndex = stream.engineMode === 'distance' ? stream.segIndex : stream.currentIndex;
-        const totalPoints = stream.points ? stream.points.length : 0;
-        const dbId = stream.dbId;
-
+        // 1. Clean memory and timers FIRST (idempotent)
         await cleanupStream(deviceId, `User requested stop`);
 
-        if (dbId) {
-            try {
+        // 2. Safely update Database (idempotent)
+        try {
+            const activeDbStream = await prisma.stream.findFirst({
+                where: { deviceId, stoppedAt: null },
+                orderBy: { startedAt: 'desc' },
+                select: { id: true }
+            });
+
+            if (activeDbStream) {
                 await prisma.stream.update({
-                    where: { id: dbId },
+                    where: { id: activeDbStream.id },
                     data: {
                         status: 'STOPPED',
                         stoppedAt: new Date()
                     }
                 });
-            } catch (err) {
-                console.error(`[Stream] DB error on stop for ${deviceId}`, err.message);
             }
+        } catch (err) {
+            console.error(`[Stream] DB error on stop for ${deviceId}:`, err.message);
         }
 
         const data = {
             deviceId,
             status: 'stopped',
             finalIndex,
-            totalPoints
+            totalPoints,
+            noop: !stream
         };
 
         // Output structured log as requested
@@ -887,7 +899,7 @@ async function stopStream(deviceId) {
     } catch (criticalError) {
         console.error(`[Stream] Critical error stopping stream for ${deviceId}:`, criticalError.stack);
         // Best effort cleanup even on complete failure
-        await cleanupStream(deviceId, 'crash_recovery');
+        await cleanupStream(deviceId, 'crash_recovery').catch(() => { });
         return { deviceId, status: 'stopped', error: 'Stopped with errors' };
     }
 }

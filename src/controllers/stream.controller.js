@@ -190,7 +190,7 @@ async function resumeStream(req, res) {
  */
 async function stopStream(req, res) {
     try {
-        const { deviceId } = req.body;
+        const deviceId = req.body?.deviceId;
         const userId = req.user?.userId;
 
         if (!deviceId) {
