@@ -242,12 +242,13 @@ wss.on('connection', async (ws, req) => {
 
     // Broadcast to dashboards (non-fatal)
     try {
-        broadcast('DEVICE_CONNECTED', { deviceId, ip: clientIp });
+        if (clientType !== 'admin') {
+            broadcast('DEVICE_CONNECTED', { deviceId, ip: clientIp });
+            console.log(`✅ Device ${deviceId} connected via WebSocket (clientType: ${clientType})`);
+        }
     } catch (broadcastErr) {
         console.warn(`⚠️ [WS] Broadcast failed (non-fatal):`, broadcastErr.message);
     }
-
-    console.log(`✅ Device ${deviceId} connected via WebSocket (clientType: ${clientType})`);
 
     // Send CONNECTED frame to Android — always, regardless of internal errors above
     ws.send(JSON.stringify({
@@ -263,9 +264,16 @@ wss.on('connection', async (ws, req) => {
     // Handle incoming messages from device
     // ═══════════════════════════════════════════════════════════════════
     ws.on('message', async (data) => {
+        // Any message from the client (including JSON PINGs) means it's alive.
+        // This prevents the 25s heartbeat monitor from falsely terminating Android clients.
+        ws.isAlive = true;
+
         try {
             const message = JSON.parse(data.toString());
-            console.log(`📥 Message from ${deviceId}:`, message.type);
+            // Only log if not a spammy PING to keep terminal clean
+            if (message.type !== 'PING') {
+                console.log(`📥 Message from ${deviceId || 'admin'}:`, message.type);
+            }
 
             switch (message.type) {
                 case 'PING':
