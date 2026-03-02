@@ -199,8 +199,13 @@ async function emitNextCoordinate(deviceId) {
 
             // Auto cleanup after 10 ticks without WS socket
             if (stream.wsMissCount > 10) {
-                console.warn(`[Stream] WS not ready for ${deviceId} for too long. Auto-stopping stream.`);
-                await stopStream(deviceId).catch(e => console.error('Error auto-stopping orphaned stream:', e));
+                // Throttle the warning log to once every 10 ticks
+                if (stream.wsMissCount % 10 === 0) {
+                    console.warn(`[Stream] WS not ready for ${deviceId} for too long (miss #${stream.wsMissCount}). Auto-pausing stream.`);
+                }
+                if (stream.status !== 'paused') {
+                    await pauseStream(deviceId).catch(e => console.error('Error auto-pausing orphaned stream:', e));
+                }
                 return;
             }
 

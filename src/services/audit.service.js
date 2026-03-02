@@ -23,12 +23,27 @@ async function log(action, { userId = null, deviceId = null, meta = null } = {})
             });
         }
 
+        let userOk = null;
+        if (userId) {
+            userOk = await prisma.user.findUnique({
+                where: { id: userId },
+                select: { id: true }
+            });
+        }
+
+        const validUserId = userOk ? userId : null;
+        const validDeviceId = deviceOk ? deviceId : null;
+
         await prisma.auditLog.create({
             data: {
                 action,
-                userId,
-                deviceId: deviceOk ? deviceId : null,
-                meta: { ...(meta || {}), attemptedDeviceId: deviceId || null }
+                userId: validUserId,
+                deviceId: validDeviceId,
+                meta: {
+                    ...(meta || {}),
+                    attemptedDeviceId: deviceId || null,
+                    attemptedUserId: userId || null
+                }
             }
         });
     } catch (error) {
