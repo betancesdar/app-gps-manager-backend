@@ -213,7 +213,7 @@ async function emitNextCoordinate(deviceId) {
                 await pauseStream(deviceId).catch(e => console.error('Error auto-pausing closed ws:', e));
             } else {
                 // Throttle spammy "WS not ready" logs when paused
-                if (stream.wsMissCount % 5 === 1) {
+                if (stream.wsMissCount % 10 === 0) {
                     console.log(`[Stream] WS not ready for ${deviceId} while paused. Skipping tick (miss #${stream.wsMissCount}).`);
                 }
             }
@@ -978,6 +978,24 @@ async function skipDwell(deviceId) {
         stream.dwellTicksRemaining = 0;
         stream.state = 'MOVE';
         stream.vTargetMps = stream.config.speed / 3.6;
+
+        // Mark waypoint as completed so we don't re-trigger
+        if (stream.currentWaitPlanId) {
+            const currentWait = stream.waitPlan.find(w => w.id === stream.currentWaitPlanId);
+            if (currentWait) {
+                currentWait.completed = true;
+            }
+        }
+
+        // Escape the magnetic trap of the waypoint by advancing the index
+        if (stream.engineMode === 'distance') {
+            const fromIndex = stream.segIndex;
+            stream.segIndex = Math.min(stream.segIndex + 1, stream.points.length - 1);
+            stream.segProgress = 0;
+            console.log(`[Stream] skip escape: moved from ${fromIndex} to ${stream.segIndex}`);
+        } else {
+            stream.currentIndex = Math.min(stream.currentIndex + 1, stream.points.length - 1);
+        }
 
         console.log(`[Stream] STREAM_WAITING_SKIP device=${deviceId}`);
         const { broadcast } = require('../websocket/ws.server');

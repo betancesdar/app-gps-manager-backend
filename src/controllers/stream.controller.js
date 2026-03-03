@@ -110,6 +110,13 @@ async function pauseStream(req, res) {
             });
         }
 
+        if (!streamService.hasActiveStream(deviceId)) {
+            return res.status(200).json({
+                success: true,
+                message: 'Stream not active or already handled'
+            });
+        }
+
         const result = await streamService.pauseStream(deviceId);
 
         if (!result) {
@@ -155,6 +162,13 @@ async function resumeStream(req, res) {
             });
         }
 
+        if (!streamService.hasActiveStream(deviceId)) {
+            return res.status(200).json({
+                success: true,
+                message: 'Stream not active or already handled'
+            });
+        }
+
         const result = await streamService.resumeStream(deviceId);
 
         if (!result) {
@@ -197,6 +211,13 @@ async function stopStream(req, res) {
             return res.status(400).json({
                 success: false,
                 error: 'deviceId is required'
+            });
+        }
+
+        if (!streamService.hasActiveStream(deviceId)) {
+            return res.status(200).json({
+                success: true,
+                message: 'Stream not active or already handled'
             });
         }
 
@@ -273,6 +294,13 @@ async function skipDwell(req, res) {
 
         if (!deviceId) return res.status(400).json({ success: false, error: 'deviceId is required' });
 
+        if (!streamService.hasActiveStream(deviceId)) {
+            return res.status(200).json({
+                success: true,
+                message: 'Stream not active or already handled'
+            });
+        }
+
         const result = await streamService.skipDwell(deviceId);
         if (!result || !result.success) {
             return res.status(400).json({ success: false, error: result?.message || 'Failed to skip dwell' });
@@ -303,6 +331,13 @@ async function extendDwell(req, res) {
         if (!deviceId) return res.status(400).json({ success: false, error: 'deviceId is required' });
         if (!seconds || isNaN(seconds) || seconds <= 0) {
             return res.status(400).json({ success: false, error: 'valid positive seconds parameter is required' });
+        }
+
+        if (!streamService.hasActiveStream(deviceId)) {
+            return res.status(200).json({
+                success: true,
+                message: 'Stream not active or already handled'
+            });
         }
 
         const result = await streamService.extendDwell(deviceId, parseInt(seconds));
