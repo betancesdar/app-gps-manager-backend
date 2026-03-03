@@ -76,6 +76,7 @@ async function getAllDevices(req, res) {
         const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
 
         let devices = await deviceService.getAllDevices();
+        const streamService = require('../services/stream.service');
 
         // Filter
         if (activeWithinSeconds) {
@@ -96,9 +97,18 @@ async function getAllDevices(req, res) {
         const offset = (page - 1) * limit;
         const paged = devices.slice(offset, offset + limit);
 
-        return res.status(200).json({
-            success: true,
-            data: paged.map(d => ({
+        const enrichedData = await Promise.all(paged.map(async d => {
+            let streamData = { status: null, state: null };
+            try {
+                const s = await streamService.getStreamStatus(d.deviceId);
+                if (s) {
+                    streamData.status = s.status;
+                    streamData.state = s.state;
+                }
+            } catch (e) {
+                // Ignore silent misses
+            }
+            return {
                 deviceId: d.deviceId,
                 label: d.label,
                 platform: d.platform,
@@ -106,8 +116,16 @@ async function getAllDevices(req, res) {
                 registeredAt: d.registeredAt,
                 lastSeenAt: d.lastSeenAt,
                 isConnected: d.isConnected,
-                user: d.user?.username
-            })),
+                user: d.user?.username,
+                assignedRouteId: d.assignedRouteId || null,
+                streamStatus: streamData.status,
+                streamState: streamData.state
+            };
+        }));
+
+        return res.status(200).json({
+            success: true,
+            data: enrichedData,
             pagination: { page, limit, total, totalPages, hasMore: page < totalPages },
             count: paged.length
         });
@@ -128,11 +146,29 @@ async function getMyDevices(req, res) {
     try {
         const userId = req.user.userId;
         const devices = await deviceService.getDevicesByUser(userId);
+        const streamService = require('../services/stream.service');
+
+        const enrichedData = await Promise.all(devices.map(async d => {
+            let streamData = { status: null, state: null };
+            try {
+                const s = await streamService.getStreamStatus(d.deviceId);
+                if (s) {
+                    streamData.status = s.status;
+                    streamData.state = s.state;
+                }
+            } catch (e) { }
+            return {
+                ...d,
+                assignedRouteId: d.assignedRouteId || null,
+                streamStatus: streamData.status,
+                streamState: streamData.state
+            };
+        }));
 
         return res.status(200).json({
             success: true,
-            data: devices,
-            count: devices.length
+            data: enrichedData,
+            count: enrichedData.length
         });
     } catch (error) {
         console.error('Get my devices error:', error);
