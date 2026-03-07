@@ -46,7 +46,7 @@ function broadcast(type, payload) {
 const heartbeatInterval = setInterval(() => {
     wss.clients.forEach((ws) => {
         if (ws.isAlive === false) {
-            console.log(`[WS] 💀 Terminating dead connection (No PONG received in 25s)`);
+            console.log(`[WS] 💀 Terminating dead connection (No PONG received in 45s)`);
             return ws.terminate();
         }
         ws.isAlive = false;
@@ -57,7 +57,7 @@ const heartbeatInterval = setInterval(() => {
             return ws.terminate();
         }
     });
-}, 25000);
+}, 45000);
 
 wss.on('close', () => {
     clearInterval(heartbeatInterval);
