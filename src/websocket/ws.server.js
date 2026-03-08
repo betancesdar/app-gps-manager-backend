@@ -45,11 +45,11 @@ function broadcast(type, payload) {
 // ── Heartbeat Loop (Server -> Client) ─────────────────────────────────────────
 const heartbeatInterval = setInterval(() => {
     wss.clients.forEach((ws) => {
-        if (ws.isAlive === false) {
-            console.log(`[WS] 💀 Terminating dead connection (No PONG received in 45s)`);
+        if (ws.missedPings >= 4) {
+            console.log(`[WS] 💀 Terminating dead connection (No PONG received in 80s)`);
             return ws.terminate();
         }
-        ws.isAlive = false;
+        ws.missedPings = (ws.missedPings || 0) + 1;
         try {
             ws.ping();
         } catch (error) {
@@ -57,7 +57,7 @@ const heartbeatInterval = setInterval(() => {
             return ws.terminate();
         }
     });
-}, 45000);
+}, 20000);
 
 wss.on('close', () => {
     clearInterval(heartbeatInterval);
@@ -93,8 +93,10 @@ wss.on('connection', async (ws, req) => {
 
     // Heartbeat setup for this client
     ws.isAlive = true;
+    ws.missedPings = 0;
     ws.on('pong', () => {
         ws.isAlive = true;
+        ws.missedPings = 0;
     });
 
     // ═══════════════════════════════════════════════════════════════════
