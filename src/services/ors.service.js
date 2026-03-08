@@ -141,7 +141,8 @@ async function getDirections(origin, destination, profile = 'driving-car') {
                     [destination.lng, destination.lat]
                 ],
                 instructions: false,
-                elevation: false
+                elevation: false,
+                geometry_simplify: false
             },
             {
                 headers: {
@@ -387,7 +388,8 @@ async function getDirectionsMulti(waypoints, profile = 'driving-car') {
         const payload = {
             coordinates,
             instructions: false,
-            elevation: false
+            elevation: false,
+            geometry_simplify: false
         };
 
         let response;
