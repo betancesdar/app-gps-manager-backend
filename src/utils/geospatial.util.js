@@ -101,6 +101,13 @@ function resamplePoints(points, spacingMeters = 15) {
         }
 
         distanceFromLast += remainingDistance;
+
+        // Preserve all original points (corners) to prevent "cutting across blocks" 
+        // If the last inserted point isn't practically identical to the original corner, insert it.
+        if (calculateDistance(resampled[resampled.length - 1], curr) > 1) {
+            resampled.push(curr);
+            distanceFromLast = 0; // Anchor the next 15m interpolation exactly from this corner
+        }
     }
 
     // Always push the absolute last point to ensure the route finishes exactly at the destination
