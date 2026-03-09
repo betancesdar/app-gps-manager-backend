@@ -871,15 +871,31 @@ async function createFromWaypoints(req, res) {
         // and mark it with dwellSeconds.
         const { calculateDistance } = geospatialUtil;
         let searchStartIndex = 0;
+        const searchWindow = Math.max(100, spacing * 3); // meters threshold to consider "close enough"
+
         const waypointsWithIndex = resolvedWaypoints.map((wp, wpIdx) => {
             let bestIdx = searchStartIndex;
             let bestDist = Infinity;
-            // Search chronologically from the last found index
-            for (let pi = searchStartIndex; pi < pointsWithMeta.length; pi++) {
-                const d = calculateDistance(pointsWithMeta[pi], wp);
-                if (d < bestDist) {
-                    bestDist = d;
-                    bestIdx = pi;
+
+            if (wpIdx === 0) {
+                // The first waypoint is always exactly the start of the route
+                bestIdx = 0;
+                bestDist = 0;
+            } else if (wpIdx === resolvedWaypoints.length - 1) {
+                // The last waypoint is always exactly the end of the route
+                bestIdx = pointsWithMeta.length - 1;
+                bestDist = 0;
+            } else {
+                // Search chronologically from the last found index
+                for (let pi = searchStartIndex; pi < pointsWithMeta.length; pi++) {
+                    const d = calculateDistance(pointsWithMeta[pi], wp);
+                    if (d < bestDist) {
+                        bestDist = d;
+                        bestIdx = pi;
+                    } else if (bestDist < searchWindow && d > bestDist + (spacing * 2)) {
+                        // Local minimum found, break to prevent matching the return leg of a round trip
+                        break;
+                    }
                 }
             }
 
