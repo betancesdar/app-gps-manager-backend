@@ -870,16 +870,22 @@ async function createFromWaypoints(req, res) {
         // For each waypoint, find the closest point in the resampled array
         // and mark it with dwellSeconds.
         const { calculateDistance } = geospatialUtil;
+        let searchStartIndex = 0;
         const waypointsWithIndex = resolvedWaypoints.map((wp, wpIdx) => {
-            let bestIdx = 0;
+            let bestIdx = searchStartIndex;
             let bestDist = Infinity;
-            for (let pi = 0; pi < pointsWithMeta.length; pi++) {
+            // Search chronologically from the last found index
+            for (let pi = searchStartIndex; pi < pointsWithMeta.length; pi++) {
                 const d = calculateDistance(pointsWithMeta[pi], wp);
                 if (d < bestDist) {
                     bestDist = d;
                     bestIdx = pi;
                 }
             }
+
+            // The next waypoint must exist chronologically AFTER this waypoint's match
+            searchStartIndex = bestIdx;
+
             // Mark the route point with dwell
             if (wp.dwellSeconds > 0) {
                 pointsWithMeta[bestIdx].dwellSeconds = wp.dwellSeconds;
