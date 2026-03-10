@@ -68,6 +68,7 @@ async function getAllDevices() {
 async function getDevicesByUser(userId) {
     return prisma.device.findMany({
         where: { userId },
+        include: { user: { select: { username: true } } },
         orderBy: { lastSeenAt: 'desc' }
     });
 }

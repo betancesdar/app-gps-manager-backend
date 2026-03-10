@@ -2,6 +2,8 @@ const express = require('express');
 const router = express.Router();
 const deviceController = require('../controllers/device.controller');
 const authMiddleware = require('../middleware/auth.middleware');
+const adminMiddleware = require('../middleware/admin.middleware');
+const deviceOwnershipMiddleware = require('../middleware/deviceOwnership.middleware');
 const { createIpRateLimit } = require('../middleware/rateLimit.middleware');
 
 // Rate limit: 30 activate attempts per minute per IP
@@ -22,11 +24,11 @@ router.post('/register', deviceController.registerDevice);
 router.get('/', deviceController.getAllDevices);
 router.get('/me', deviceController.getMyDevices); // Keep backward compat
 router.get('/:deviceId', deviceController.getDevice);
-router.delete('/:deviceId', deviceController.deleteDevice);
-router.put('/:deviceId/route', deviceController.assignRoute);
+router.delete('/:deviceId', adminMiddleware, deviceController.deleteDevice);
+router.put('/:deviceId/route', deviceOwnershipMiddleware, deviceController.assignRoute);
 
 // Advanced Device Management (Admin / Enrollment)
 router.post('/enroll', deviceController.enroll);
-router.post('/cleanup-stale', deviceController.cleanup);
+router.post('/cleanup-stale', adminMiddleware, deviceController.cleanup);
 
 module.exports = router;

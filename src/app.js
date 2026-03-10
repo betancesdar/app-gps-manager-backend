@@ -19,6 +19,7 @@ const deviceRoutes = require('./routes/device.routes');
 const routeRoutes = require('./routes/route.routes');
 const streamRoutes = require('./routes/stream.routes');
 const geocodeRoutes = require('./routes/geocode.routes');
+const userRoutes = require('./routes/user.routes');
 
 const app = express();
 const isProd = config.NODE_ENV === 'production';
@@ -144,6 +145,7 @@ app.use('/api/devices', deviceRoutes);
 app.use('/api/routes', routeRoutes);
 app.use('/api/stream', streamRoutes);
 app.use('/api/geocode', geocodeRoutes);
+app.use('/api/users', userRoutes);
 
 // ── 404 handler ───────────────────────────────────────────────────────────────
 app.use((req, res) => {
