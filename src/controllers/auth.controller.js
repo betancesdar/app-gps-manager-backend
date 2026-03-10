@@ -37,6 +37,19 @@ async function login(req, res) {
             });
         }
 
+        if (user.isActive === false) {
+            // Log failed attempt
+            await auditService.log(auditService.ACTIONS.LOGIN_FAILED, {
+                userId: user.id,
+                meta: { reason: 'Account disabled' }
+            });
+
+            return res.status(403).json({
+                success: false,
+                error: 'Account deactivated. Please contact an administrator.'
+            });
+        }
+
         // Validate password with bcrypt
         const isValidPassword = await userService.validatePassword(password, user.passwordHash);
 

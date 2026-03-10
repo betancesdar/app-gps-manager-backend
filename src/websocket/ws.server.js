@@ -16,11 +16,6 @@ const auditService = require('../services/audit.service');
 // This is CRITICAL - prevents Express from intercepting /ws
 const wss = new WebSocketServer({ noServer: true });
 
-/**
- * Broadcast message to all connected clients (dashboards)
- * @param {string} type 
- * @param {Object} payload 
- */
 function broadcast(type, payload) {
     // Serialize once to prevent event loop blocking on massive broadcasts
     const messageStr = JSON.stringify({
@@ -32,8 +27,16 @@ function broadcast(type, payload) {
     wss.clients.forEach(client => {
         // Filter: Device and Stream events go only to admins (dashboards).
         // Exceptions: MOCK_LOCATION goes to the specific device.
-        if ((type.startsWith('DEVICE_') || type.startsWith('STREAM_')) && client.clientType !== 'admin') {
+        if ((type.startsWith('DEVICE_') || type.startsWith('STREAM_') || type === 'LOCATION_UPDATE') && client.clientType !== 'admin') {
             return;
+        }
+
+        // Cross-Tenant Security: If dashboard is NOT a global ADMIN, only send if payload.ownerId matches
+        if (client.clientType === 'admin' && client.userRole !== 'ADMIN' && client.userRole !== 'admin') {
+            // We rely on every broadcast supplying `ownerId`
+            if (payload.ownerId && payload.ownerId !== client.userId) {
+                return;
+            }
         }
 
         if (client.readyState === 1) { // OPEN
@@ -161,7 +164,9 @@ wss.on('connection', async (ws, req) => {
             userId = decodedToken.userId;
             isAuthorized = true;
             clientType = 'admin';
-            console.log(`✅ WS Auth: User JWT for Global Connection (User: ${userId})`);
+            ws.userId = userId;
+            ws.userRole = decodedToken.role.toUpperCase();
+            console.log(`✅ WS Auth: User JWT for Global Connection (User: ${userId}, Role: ${ws.userRole})`);
         } else if (decodedToken && decodedToken.deviceId === deviceId) {
             isAuthorized = true;
             clientType = 'device';
@@ -250,7 +255,9 @@ wss.on('connection', async (ws, req) => {
     // Broadcast to dashboards (non-fatal)
     try {
         if (clientType !== 'admin') {
-            broadcast('DEVICE_CONNECTED', { deviceId, ip: clientIp });
+            const device = await deviceService.getDevice(deviceId);
+            const ownerId = device ? device.userId : null;
+            broadcast('DEVICE_CONNECTED', { deviceId, ip: clientIp, ownerId });
             console.log(`✅ Device ${deviceId} connected via WebSocket (clientType: ${clientType})`);
         }
     } catch (broadcastErr) {
@@ -334,11 +341,16 @@ wss.on('connection', async (ws, req) => {
                 meta: { code, reason: reason?.toString() }
             });
 
+            // Need ownerId to broadcast disconnect correctly
+            const device = await deviceService.getDevice(deviceId);
+            const ownerId = device ? device.userId : null;
+
             // Broadcast to dashboards
             broadcast('DEVICE_DISCONNECTED', {
                 deviceId,
                 code,
-                reason: reason?.toString()
+                reason: reason?.toString(),
+                ownerId
             });
         } catch (error) {
             console.error(`⚠️ Error handling disconnect:`, error.message);

@@ -33,9 +33,10 @@ const ENGINE_CONSTANTS = {
  * Tracks streaming state for a single device
  */
 class StreamInstance {
-    constructor(deviceId, routeId, points, waypoints, streamConfig) {
+    constructor(deviceId, routeId, points, waypoints, streamConfig, ownerId) {
         this.deviceId = deviceId;
         this.routeId = routeId;
+        this.ownerId = ownerId;
         this.points = points;
         this.waypoints = waypoints || [];
         this.config = { ...streamConfig };
@@ -131,7 +132,13 @@ async function startStream(deviceId, routeId, options = {}) {
         loop: options.loop !== undefined ? options.loop : (route.config?.loop || config.STREAM_DEFAULTS.loop)
     };
 
-    const stream = new StreamInstance(deviceId, routeId, route.points, route.waypoints, streamConfig);
+    const device = await prisma.device.findUnique({
+        where: { deviceId },
+        select: { userId: true }
+    });
+    const ownerId = device?.userId;
+
+    const stream = new StreamInstance(deviceId, routeId, route.points, route.waypoints, streamConfig, ownerId);
     stream.status = 'running';
     stream.startedAt = new Date().toISOString();
 
@@ -336,7 +343,8 @@ async function emitNextCoordinate(deviceId) {
                         broadcast('STREAM_WAITING_TICK', {
                             streamId: stream.dbId,
                             deviceId,
-                            remainingMs: stream.dwellTicksRemaining * stream.config.intervalMs
+                            remainingMs: stream.dwellTicksRemaining * stream.config.intervalMs,
+                            ownerId: stream.ownerId
                         });
                     }
 
@@ -463,7 +471,8 @@ async function emitNextCoordinate(deviceId) {
                         kind: crossWait.kind,
                         label: crossWait.label,
                         mode: crossWait.mode,
-                        remainingMs: crossWait.dwellSeconds * 1000
+                        remainingMs: crossWait.dwellSeconds * 1000,
+                        ownerId: stream.ownerId
                     });
                 }
             }
@@ -1001,7 +1010,8 @@ async function skipDwell(deviceId) {
         const { broadcast } = require('../websocket/ws.server');
         broadcast('STREAM_WAITING_SKIPPED', {
             streamId: stream.dbId,
-            deviceId
+            deviceId,
+            ownerId: stream.ownerId
         });
         return { success: true, deviceId, message: 'Dwell skipped' };
     }
@@ -1025,7 +1035,8 @@ async function extendDwell(deviceId, seconds) {
             streamId: stream.dbId,
             deviceId,
             addedSeconds: seconds,
-            newRemainingMs: stream.dwellTicksRemaining * stream.config.intervalMs
+            newRemainingMs: stream.dwellTicksRemaining * stream.config.intervalMs,
+            ownerId: stream.ownerId
         });
         return { success: true, deviceId, addedSeconds: seconds };
     }

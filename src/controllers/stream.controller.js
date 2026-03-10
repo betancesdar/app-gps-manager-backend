@@ -76,8 +76,9 @@ async function startStream(req, res) {
         broadcast('STREAM_STARTED', {
             deviceId,
             routeId,
-            speed: stream.config.speed,
-            loop: stream.config.loop
+            speed: stream.config?.speed || stream.speed,
+            loop: stream.config?.loop || stream.loop,
+            ownerId: stream.ownerId
         });
 
         return res.status(200).json({
@@ -236,8 +237,9 @@ async function stopStream(req, res) {
             deviceId
         });
 
+        const device = await deviceService.getDevice(deviceId);
         // Broadcast stream stopped
-        broadcast('STREAM_STOPPED', { deviceId });
+        broadcast('STREAM_STOPPED', { deviceId, ownerId: device?.userId });
 
         return res.status(200).json({
             success: true,

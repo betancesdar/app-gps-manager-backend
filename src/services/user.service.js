@@ -90,10 +90,30 @@ async function getAllUsers() {
             id: true,
             username: true,
             role: true,
+            isActive: true,
             createdAt: true,
             _count: {
                 select: { devices: true }
             }
+        }
+    });
+}
+
+/**
+ * Toggle user active status
+ * @param {string} id 
+ * @param {boolean} isActive 
+ * @returns {Object}
+ */
+async function toggleUserStatus(id, isActive) {
+    return prisma.user.update({
+        where: { id },
+        data: { isActive },
+        select: {
+            id: true,
+            username: true,
+            isActive: true,
+            role: true
         }
     });
 }
@@ -104,5 +124,6 @@ module.exports = {
     createUser,
     validatePassword,
     ensureDefaultUser,
-    getAllUsers
+    getAllUsers,
+    toggleUserStatus
 };

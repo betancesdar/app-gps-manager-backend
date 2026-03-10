@@ -83,7 +83,36 @@ async function createUser(req, res) {
     }
 }
 
+/**
+ * Toggle user active status (Admin only)
+ */
+async function toggleStatus(req, res) {
+    try {
+        if (req.user.role !== 'admin' && req.user.role !== 'ADMIN') {
+            return res.status(403).json({ success: false, error: 'Forbidden' });
+        }
+
+        const { id } = req.params;
+        const { isActive } = req.body;
+
+        if (typeof isActive !== 'boolean') {
+            return res.status(400).json({ success: false, error: 'isActive must be a boolean' });
+        }
+
+        const updatedUser = await userService.toggleUserStatus(id, isActive);
+
+        return res.status(200).json({
+            success: true,
+            data: updatedUser
+        });
+    } catch (error) {
+        console.error('Error toggling user status:', error);
+        return res.status(500).json({ success: false, error: 'Failed' });
+    }
+}
+
 module.exports = {
     getAllUsers,
-    createUser
+    createUser,
+    toggleStatus
 };
