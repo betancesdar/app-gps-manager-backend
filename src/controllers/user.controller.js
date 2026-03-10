@@ -10,7 +10,7 @@ const userService = require('../services/user.service');
  */
 async function getAllUsers(req, res) {
     try {
-        if (req.user.role !== 'admin') {
+        if (req.user.role !== 'admin' && req.user.role !== 'ADMIN') {
             return res.status(403).json({ success: false, error: 'Forbidden' });
         }
 
@@ -34,7 +34,7 @@ async function getAllUsers(req, res) {
  */
 async function createUser(req, res) {
     try {
-        if (req.user.role !== 'admin') {
+        if (req.user.role !== 'admin' && req.user.role !== 'ADMIN') {
             return res.status(403).json({ success: false, error: 'Forbidden' });
         }
 
