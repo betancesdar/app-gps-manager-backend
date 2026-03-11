@@ -527,8 +527,8 @@ async function getAllRoutes(req, res) {
         const page = Math.max(1, parseInt(req.query.page) || 1);
         const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
 
-        // If admin, show all routes; otherwise filter by user
-        const filterUserId = req.user?.role === 'admin' ? null : userId;
+        // All authenticated users can see all routes to allow assignment
+        const filterUserId = null;
 
         const routes = await routeService.getAllRoutes(filterUserId);
 
@@ -866,8 +866,11 @@ async function createFromWaypoints(req, res) {
             };
         });
 
-        // ── Step 5: Map waypoints to nearest route point indices ──────────
-        // For each waypoint, find the closest point in the resampled array
+        // ── Step 5: Process with Safety Gate BEFORE finding indices ────────
+        const safePoints = applySafetyGate(pointsWithMeta);
+
+        // ── Step 6: Map waypoints to nearest route point indices ──────────
+        // For each waypoint, find the closest point in the safePoints array
         // and mark it with dwellSeconds.
         const { calculateDistance } = geospatialUtil;
         let searchStartIndex = 0;
@@ -878,41 +881,33 @@ async function createFromWaypoints(req, res) {
             let bestDist = Infinity;
 
             if (wpIdx === 0) {
-                // The first waypoint is always exactly the start of the route
                 bestIdx = 0;
                 bestDist = 0;
             } else if (wpIdx === resolvedWaypoints.length - 1) {
-                // The last waypoint is always exactly the end of the route
-                bestIdx = pointsWithMeta.length - 1;
+                bestIdx = safePoints.length - 1;
                 bestDist = 0;
             } else {
-                // Search chronologically from the last found index
-                for (let pi = searchStartIndex; pi < pointsWithMeta.length; pi++) {
-                    const d = calculateDistance(pointsWithMeta[pi], wp);
+                for (let pi = searchStartIndex; pi < safePoints.length; pi++) {
+                    const d = calculateDistance(safePoints[pi], wp);
                     if (d < bestDist) {
                         bestDist = d;
                         bestIdx = pi;
                     } else if (bestDist < searchWindow && d > bestDist + (spacing * 2)) {
-                        // Local minimum found, break to prevent matching the return leg of a round trip
                         break;
                     }
                 }
             }
 
-            // The next waypoint must exist chronologically AFTER this waypoint's match
             searchStartIndex = bestIdx;
 
-            // Mark the route point with dwell
             if (wp.dwellSeconds > 0) {
-                pointsWithMeta[bestIdx].dwellSeconds = wp.dwellSeconds;
+                safePoints[bestIdx].dwellSeconds = wp.dwellSeconds;
             }
             return { ...wp, pointIndex: bestIdx };
         });
 
-        // ── Step 6: Persist route + waypoints ────────────────────────────
+        // ── Step 7: Persist route + waypoints ────────────────────────────
         const routeName = name || `${resolvedWaypoints[0].label || 'Origin'} → ${resolvedWaypoints[resolvedWaypoints.length - 1].label || 'Destination'}`;
-
-        const safePoints = applySafetyGate(pointsWithMeta);
 
         const route = await routeService.createRouteWithWaypoints(
             {
