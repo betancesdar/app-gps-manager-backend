@@ -76,7 +76,7 @@ async function getAllDevices(req, res) {
         const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
 
         let devices;
-        if (req.user.role === 'admin') {
+        if (req.user.role === 'admin' || req.user.role === 'ADMIN') {
             devices = await deviceService.getAllDevices();
         } else {
             devices = await deviceService.getDevicesByUser(req.user.userId);

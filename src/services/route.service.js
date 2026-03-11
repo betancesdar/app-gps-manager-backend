@@ -132,6 +132,73 @@ async function createRouteWithWaypoints(routeData, userId) {
 }
 
 /**
+ * Update a route with named waypoints and new geometry (Full Edit feature)
+ * @param {string} routeId
+ * @param {Object} routeData - { name, points, waypoints }
+ * @param {string} userId
+ * @returns {Object} Updated route
+ */
+async function updateRouteWithWaypoints(routeId, routeData, userId) {
+    const { name, points, waypoints } = routeData;
+
+    if (!validateCoordinates(points)) {
+        throw new Error('Invalid coordinates');
+    }
+
+    if (!waypoints || !Array.isArray(waypoints) || waypoints.length < 2) {
+        throw new Error('At least 2 waypoints are required');
+    }
+
+    // Verify ownership or existence
+    const existing = await prisma.route.findUnique({ where: { id: routeId } });
+    if (!existing) throw new Error('Route not found');
+
+    // Replace points and waypoints in a single transaction
+    const route = await prisma.route.update({
+        where: { id: routeId },
+        data: {
+            name: name || existing.name,
+            points: {
+                deleteMany: {}, // Delete all old points
+                create: points.map((p, index) => ({
+                    seq: index,
+                    lat: parseFloat(p.lat),
+                    lng: parseFloat(p.lng),
+                    speed: p.speed ? parseFloat(p.speed) : null,
+                    bearing: p.bearing ? parseFloat(p.bearing) : null,
+                    accuracy: p.accuracy ? parseFloat(p.accuracy) : null,
+                    dwellSeconds: p.dwellSeconds ? parseInt(p.dwellSeconds) : 0
+                }))
+            },
+            waypoints: {
+                deleteMany: {}, // Delete all old waypoints
+                create: waypoints.map((wp, index) => ({
+                    seq: index,
+                    kind: wp.kind,
+                    mode: wp.mode,
+                    label: wp.label || null,
+                    text: wp.text || null,
+                    lat: parseFloat(wp.lat),
+                    lng: parseFloat(wp.lng),
+                    dwellSeconds: parseInt(wp.dwellSeconds) || 0,
+                    pointIndex: parseInt(wp.pointIndex) || 0
+                }))
+            }
+        },
+        include: {
+            points: {
+                orderBy: { seq: 'asc' }
+            },
+            waypoints: {
+                orderBy: { seq: 'asc' }
+            }
+        }
+    });
+
+    return formatRouteResponseWithWaypoints(route);
+}
+
+/**
  * Get route by ID with points
  * @param {string} routeId 
  * @returns {Object|null}
@@ -314,6 +381,7 @@ function formatRouteResponseWithWaypoints(route) {
 module.exports = {
     createRoute,
     createRouteWithWaypoints,
+    updateRouteWithWaypoints,
     getRoute,
     getAllRoutes,
     updateRouteConfig,

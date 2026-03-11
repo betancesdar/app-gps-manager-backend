@@ -966,12 +966,125 @@ async function createFromWaypoints(req, res) {
     }
 }
 
+/**
+ * PUT /api/routes/:routeId
+ * Update route from waypoints (Full Edit)
+ */
+async function updateFromWaypoints(req, res) {
+    try {
+        const { routeId } = req.params;
+        const { waypoints, profile, pointSpacingMeters, name } = req.body;
+        const userId = req.user.id; // Usually we'd check if role isAdmin or if ownership matches, but backend middleware handles this
+
+        // 1. Basic validation
+        if (!waypoints || !Array.isArray(waypoints) || waypoints.length < 2) {
+            return res.status(400).json({ success: false, error: 'At least 2 waypoints are required' });
+        }
+
+        const validProfiles = ['driving-car', 'driving-hgv', 'foot-walking', 'cycling-regular'];
+        const selectedProfile = validProfiles.includes(profile) ? profile : 'driving-car';
+        const spacing = pointSpacingMeters || config.WAYPOINT_DEFAULTS.pointSpacingMeters || 20;
+
+        // 2. Resolve coordinates (same logic as create)
+        const resolvedWaypoints = await resolveWaypointsCoordinates(waypoints);
+        
+        // 3. Request route from ORS
+        const orsCoordinates = resolvedWaypoints.map(wp => [wp.lng, wp.lat]);
+        const directions = await orsService.getDirections(orsCoordinates, selectedProfile);
+
+        if (!directions.features || !directions.features.length) {
+            return res.status(400).json({ success: false, error: 'No route found between waypoints' });
+        }
+
+        const routeFeature = directions.features[0];
+        
+        let geometry = [];
+        if (Array.isArray(routeFeature.geometry?.coordinates)) {
+            geometry = routeFeature.geometry.coordinates; // Format 1
+        } else if (routeFeature.geometry) {
+            geometry = orsService.decodePolyline(routeFeature.geometry); // Format 2
+        } else {
+            return res.status(500).json({ success: false, error: 'Invalid geometry returned by ORS' });
+        }
+
+        const distanceMeters = routeFeature.properties.segments.reduce((acc, seg) => acc + (seg.distance || 0), 0);
+        const durationSeconds = routeFeature.properties.segments.reduce((acc, seg) => acc + (seg.duration || 0), 0);
+
+        const routePoints = geometry.map(coord => ({
+            lat: coord[1],
+            lng: coord[0]
+        }));
+
+        let pointsWithMeta = resampleRouteGeometry(routePoints, spacing);
+
+        // Map waypoints to closest points and apply dwell times
+        let finalWaypoints = JSON.parse(JSON.stringify(resolvedWaypoints));
+
+        // APPLY SAFETY GATE BEFORE ALIGNING WAYPOINTS (Critical Fix)
+        pointsWithMeta = applySafetyGate(pointsWithMeta, distanceMeters);
+
+        for (let i = 0; i < finalWaypoints.length; i++) {
+            const wp = finalWaypoints[i];
+            const target = { lat: wp.lat, lng: wp.lng };
+            
+            let closestIdx = 0;
+            let minD = Infinity;
+
+            for (let j = 0; j < pointsWithMeta.length; j++) {
+                const p = pointsWithMeta[j];
+                const d = getDistanceInMeters(target.lat, target.lng, p.lat, p.lng);
+                if (d < minD) {
+                    minD = d;
+                    closestIdx = j;
+                }
+            }
+
+            wp.pointIndex = closestIdx;
+
+            if (wp.dwellSeconds > 0 && wp.kind !== 'destination') {
+                pointsWithMeta[closestIdx].dwellSeconds = wp.dwellSeconds;
+            }
+        }
+
+        const finalName = name || `Route ${Date.now()}`;
+
+        // DB Update
+        const route = await routeService.updateRouteWithWaypoints(routeId, {
+            name: finalName,
+            points: pointsWithMeta,
+            waypoints: finalWaypoints
+        }, userId);
+
+        return res.status(200).json({
+            success: true,
+            message: 'Route updated directly',
+            data: {
+                routeId: route.routeId,
+                name: route.name,
+                distanceM: Math.round(distanceMeters),
+                durationS: Math.round(durationSeconds),
+                pointsCount: pointsWithMeta.length,
+                pointSpacingMeters: spacing,
+                waypoints: route.waypoints
+            }
+        });
+
+    } catch (error) {
+        console.error('[RouteController] Update route from waypoints error:', error);
+        return res.status(500).json({
+            success: false,
+            error: error.message || 'Failed to update route from waypoints'
+        });
+    }
+}
+
 module.exports = {
     createFromPoints,
     createFromGPX,
     createFromAddresses,
     createFromAddressesWithStops,
     createFromWaypoints,
+    updateFromWaypoints,
     getAllRoutes,
     getRoute,
     updateRouteConfig,

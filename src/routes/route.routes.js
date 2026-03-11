@@ -37,6 +37,9 @@ router.get('/:routeId', routeController.getRoute);
 // PUT /api/routes/:routeId/config
 router.put('/:routeId/config', adminMiddleware, routeController.updateRouteConfig);
 
+// PUT /api/routes/:routeId (Full Edit with Waypoints)
+router.put('/:routeId', adminMiddleware, rateLimitAddresses, routeController.updateFromWaypoints);
+
 // DELETE /api/routes/:routeId
 router.delete('/:routeId', adminMiddleware, routeController.deleteRoute);
 
